@@ -16,6 +16,7 @@ dist/
 outputs/
 deploy/bin/
 deploy/dist/
+deploy/.stage/
 deploy/deployment/*
 
 # Runtime data

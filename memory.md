@@ -52,3 +52,7 @@
 - 结论：已落地第一阶段闭环：AIFAR 单服务和 bundle 升级会写入 v2 release manifest、保存远端 release 制品和服务快照；新增 `app_releases` 发布历史查询 API、AIFAR artifact rollback API、受信 rollback shell 模板和前端发布历史/回滚入口。回滚会基于目标成功 release 的远端制品与 SHA256 执行，并作为新的 rollback release 记录；`pnpm test` 与 `pnpm web:build` 通过。
 - 问题：用户要求继续看全工程，给出架构层面的优化方向。
 - 结论：当前工程基础清晰，但随着 AIFAR Runtime、发布回滚、凭据、E2E 增加，主要架构优化点集中在：抽 `installflow` 标准安装/检查/删除流程；将 AIFAR Runtime 从 `httpapi` 和超大 `ContainersView.vue` 拆到独立 runtime 控制域；拆分 registry 通用应用生命周期和 AIFAR runtime 专属能力；引入版本化 migrations 和 typed metadata；增强 worker 为持久任务/lease/统一 task metadata；将 release/backup/credential 引用治理平台化。
+
+## 2026-07-10
+- 问题：用户要求清理当前工程中可以去掉的内容。
+- 结论：已移除误入版本库的 `deploy/.stage` 打包临时目录并加入 `.gitignore`；删除前端编排旧 demo 数据、未引用类型和旧 i18n key；`pnpm web:build` 通过，验证产生的 ignored 依赖和 dist 缓存已清理。
