@@ -1,0 +1,740 @@
+package redis
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
+	"aifar-deployment/backend/internal/store"
+)
+
+type redisSentinelTopology struct {
+	MasterEndpoint    string
+	ReplicaEndpoints  []string
+	SentinelEndpoints []string
+}
+
+type redisRuntimeComponentStatus struct {
+	Checked bool
+	Status  string
+	Error   string
+}
+
+type redisRuntimeCheckResult struct {
+	Data     redisRuntimeComponentStatus
+	Sentinel redisRuntimeComponentStatus
+}
+
+func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (redisRuntimeCheckResult, error) {
+	metadata := appMetadata(instance)
+	role := metadataString(metadata, "role")
+	topology := instanceTopology(instance)
+	password := redisPassword(nil, defaultPassword)
+	installRoot := remoteInstallRoot(server, "redis", instance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(server, "redis", instance.Version)
+	resolveRoot := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi",
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+	)
+	result := redisRuntimeCheckResult{}
+	if role != "sentinel" {
+		port := instancePort(instance)
+		cmd := resolveRoot + "\n" + strings.Join([]string{
+			fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
+				installerkit.ShellQuote("aifar-redis"),
+				installerkit.ShellQuote(fmt.Sprintf("aifar-redis-%d", port)),
+			),
+			fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
+				installerkit.ShellQuote(password),
+				port,
+			),
+		}, " && ")
+		result.Data = redisRuntimeComponentStatus{Checked: true, Status: "running"}
+		if _, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis data service check failed"); err != nil {
+			result.Data.Status = "failed"
+			result.Data.Error = err.Error()
+		}
+	}
+	if topology == "sentinel" && (metadataBool(metadata, "sentinel") || role == "sentinel") {
+		sentinelPort := instanceSentinelPort(instance)
+		cmd := resolveRoot + "\n" + strings.Join([]string{
+			fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
+				installerkit.ShellQuote("aifar-redis-sentinel"),
+				installerkit.ShellQuote(fmt.Sprintf("aifar-redis-sentinel-%d", sentinelPort)),
+			),
+			fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
+				installerkit.ShellQuote(password),
+				sentinelPort,
+			),
+		}, " && ")
+		result.Sentinel = redisRuntimeComponentStatus{Checked: true, Status: "running"}
+		if _, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis sentinel service check failed"); err != nil {
+			result.Sentinel.Status = "failed"
+			result.Sentinel.Error = err.Error()
+		}
+	}
+	if !result.Data.Checked && !result.Sentinel.Checked {
+		return result, errors.New("redis runtime check has no service to verify")
+	}
+	if result.allCheckedServicesFailed() {
+		return result, result.error()
+	}
+	return result, nil
+}
+
+func (r redisRuntimeCheckResult) allCheckedServicesFailed() bool {
+	checked := false
+	for _, component := range []redisRuntimeComponentStatus{r.Data, r.Sentinel} {
+		if !component.Checked {
+			continue
+		}
+		checked = true
+		if redisStatusHealthy(component.Status) {
+			return false
+		}
+	}
+	return checked
+}
+
+func (r redisRuntimeCheckResult) aggregateStatus() string {
+	statuses := make([]string, 0, 2)
+	for _, component := range []redisRuntimeComponentStatus{r.Data, r.Sentinel} {
+		if component.Checked {
+			statuses = append(statuses, component.Status)
+		}
+	}
+	if len(statuses) == 0 {
+		return "unknown"
+	}
+	allRunning := true
+	allFailed := true
+	for _, status := range statuses {
+		if !redisStatusHealthy(status) {
+			allRunning = false
+		}
+		if redisStatusHealthy(status) {
+			allFailed = false
+		}
+	}
+	if allRunning {
+		return "running"
+	}
+	if allFailed {
+		return "failed"
+	}
+	return "degraded"
+}
+
+func (r redisRuntimeCheckResult) error() error {
+	var parts []string
+	if r.Data.Checked && !redisStatusHealthy(r.Data.Status) {
+		if strings.TrimSpace(r.Data.Error) != "" {
+			parts = append(parts, r.Data.Error)
+		} else {
+			parts = append(parts, "Redis data service is unavailable")
+		}
+	}
+	if r.Sentinel.Checked && !redisStatusHealthy(r.Sentinel.Status) {
+		if strings.TrimSpace(r.Sentinel.Error) != "" {
+			parts = append(parts, r.Sentinel.Error)
+		} else {
+			parts = append(parts, "Redis Sentinel service is unavailable")
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(parts, "; "))
+}
+
+func (r redisRuntimeCheckResult) applyDetails(details map[string]any) {
+	if r.Data.Checked {
+		details["dataStatus"] = r.Data.Status
+		if strings.TrimSpace(r.Data.Error) != "" {
+			details["dataError"] = r.Data.Error
+		}
+	}
+	if r.Sentinel.Checked {
+		details["sentinelStatus"] = r.Sentinel.Status
+		if strings.TrimSpace(r.Sentinel.Error) != "" {
+			details["sentinelError"] = r.Sentinel.Error
+		}
+	}
+}
+
+func redisRuntimeLastCheck(status string, checkedAt any, details map[string]any, componentError string) map[string]any {
+	out := map[string]any{
+		"status":    status,
+		"checkedAt": checkedAt,
+		"details":   details,
+	}
+	if strings.TrimSpace(componentError) != "" {
+		out["error"] = componentError
+	}
+	return out
+}
+
+func applyRedisRuntimeMetadata(metadata map[string]any, runtime redisRuntimeCheckResult, aggregateStatus string, details map[string]any) {
+	checkedAt := details["checkedAt"]
+	if runtime.Data.Checked {
+		metadata["lastCheck"] = redisRuntimeLastCheck(runtime.Data.Status, checkedAt, details, runtime.Data.Error)
+	} else {
+		metadata["lastCheck"] = redisRuntimeLastCheck(aggregateStatus, checkedAt, details, "")
+	}
+	if runtime.Sentinel.Checked {
+		metadata["sentinelLastCheck"] = redisRuntimeLastCheck(runtime.Sentinel.Status, checkedAt, details, runtime.Sentinel.Error)
+	} else {
+		delete(metadata, "sentinelLastCheck")
+	}
+}
+
+func (s Service) markRedisSentinelRuntimeStatus(instance store.AppInstance, role string, details map[string]any, runtime redisRuntimeCheckResult) error {
+	metadata := appMetadata(instance)
+	if role != "" {
+		metadata["role"] = role
+	}
+	status := runtime.aggregateStatus()
+	if runtime.Sentinel.Checked && !redisStatusHealthy(runtime.Sentinel.Status) {
+		clearRedisDiscoveredTopology(metadata)
+	}
+	applyRedisRuntimeMetadata(metadata, runtime, status, details)
+	clearRecoveredInstallFailure(metadata, status)
+	data, _ := json.Marshal(metadata)
+	instance.Metadata = string(data)
+	instance.Status = status
+	_, err := s.store.SaveAppInstance(instance)
+	return err
+}
+
+func (s Service) ensureRedisServiceAccess(ctx context.Context, server store.Server, instance store.AppInstance, log Logger) error {
+	topology := instanceTopology(instance)
+	role := instanceRole(instance)
+	var ports []int
+	if role != "sentinel" {
+		ports = append(ports, instancePort(instance))
+	}
+	if topology == "sentinel" && instanceHasSentinel(instance) {
+		ports = append(ports, instanceSentinelPort(instance))
+	}
+	ports = uniqueRedisPorts(ports)
+	if len(ports) == 0 {
+		return nil
+	}
+	quotedPorts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		quotedPorts = append(quotedPorts, installerkit.ShellQuote(strconv.Itoa(port)))
+	}
+	portArgs := strings.Join(quotedPorts, " ")
+	cmd := fmt.Sprintf(`SUDO=""
+if [ "$(id -u)" != "0" ]; then
+  SUDO="sudo -n"
+fi
+%s
+open_firewall_ports %s
+allow_selinux_ports redis_port_t %s`,
+		selinux.ServiceAccessHelpers(),
+		portArgs,
+		portArgs,
+	)
+	_, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis service access rule failed")
+	return err
+}
+
+func uniqueRedisPorts(ports []int) []int {
+	seen := map[int]bool{}
+	out := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if port <= 0 || port > 65535 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		out = append(out, port)
+	}
+	return out
+}
+
+func (s Service) detectRedisRole(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (string, redisSentinelTopology, error) {
+	topology := instanceTopology(instance)
+	role := instanceRole(instance)
+	password := redisPassword(nil, defaultPassword)
+	if topology == "sentinel" {
+		sentinelTopology, err := s.detectRedisSentinelTopology(ctx, server, instance, password, log)
+		if err != nil {
+			return role, redisSentinelTopology{}, err
+		}
+		if detected := s.detectRedisDataRoleQuiet(ctx, server, instance, password); detected != "" {
+			role = detected
+		}
+		instanceEndpoint := s.redisInstanceEndpoint(instance, appMetadata(instance))
+		if role != "sentinel" && normalizeEndpoint(instanceEndpoint) == normalizeEndpoint(sentinelTopology.MasterEndpoint) {
+			role = "master"
+		} else if role != "sentinel" {
+			role = "replica"
+		}
+		return role, sentinelTopology, nil
+	}
+	if role == "sentinel" {
+		return role, redisSentinelTopology{}, nil
+	}
+	detected, err := s.detectRedisDataRole(ctx, server, instance, password, log)
+	if err != nil {
+		return role, redisSentinelTopology{}, err
+	}
+	if detected != "" {
+		role = detected
+	}
+	return role, redisSentinelTopology{}, nil
+}
+
+func (s Service) detectRedisDataRole(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (string, error) {
+	cmd := redisDataRoleCommand(server, instance, password)
+	result, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis remote command failed")
+	if err != nil {
+		return "", err
+	}
+	return parseRedisDataRole(result.Stdout), nil
+}
+
+func (s Service) detectRedisDataRoleQuiet(ctx context.Context, server store.Server, instance store.AppInstance, password string) string {
+	result, err := s.remote.Run(ctx, server, redisDataRoleCommand(server, instance, password))
+	if err != nil {
+		return ""
+	}
+	return parseRedisDataRole(result.Stdout)
+}
+
+func redisDataRoleCommand(server store.Server, instance store.AppInstance, password string) string {
+	installRoot := remoteInstallRoot(server, "redis", instance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(server, "redis", instance.Version)
+	port := instancePort(instance)
+	return fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning ROLE",
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+		installerkit.ShellQuote(password),
+		port,
+	)
+}
+
+func parseRedisDataRole(stdout string) string {
+	switch strings.ToLower(firstNonEmptyLine(stdout)) {
+	case "master":
+		return "master"
+	case "slave", "replica":
+		return "replica"
+	default:
+		return ""
+	}
+}
+
+func (s Service) detectRedisSentinelTopology(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (redisSentinelTopology, error) {
+	sentinelInstance := instance
+	sentinelServer := server
+	if !instanceHasSentinel(instance) {
+		peerInstance, peerServer, err := s.findRedisSentinelPeer(instance)
+		if err != nil {
+			return redisSentinelTopology{}, err
+		}
+		sentinelInstance = peerInstance
+		sentinelServer = peerServer
+	}
+	metadata := appMetadata(sentinelInstance)
+	masterName := metadataString(metadata, "masterName")
+	if masterName == "" {
+		masterName = "aifar-master"
+	}
+	sentinelPort := instanceSentinelPort(sentinelInstance)
+	installRoot := remoteInstallRoot(sentinelServer, "redis", sentinelInstance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(sentinelServer, "redis", sentinelInstance.Version)
+	baseCmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning",
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+		installerkit.ShellQuote(password),
+		sentinelPort,
+	)
+	masterCmd := fmt.Sprintf("%s SENTINEL get-master-addr-by-name %s",
+		baseCmd,
+		installerkit.ShellQuote(masterName),
+	)
+	result, err := installerkit.Run(ctx, s.remote, sentinelServer, masterCmd, log, "redis sentinel remote command failed")
+	if err != nil {
+		return redisSentinelTopology{}, err
+	}
+	lines := nonEmptyLines(result.Stdout)
+	if len(lines) < 2 {
+		return redisSentinelTopology{}, errors.New("Redis Sentinel did not return current master address")
+	}
+	out := redisSentinelTopology{
+		MasterEndpoint: fmt.Sprintf("%s:%s", lines[0], lines[1]),
+	}
+	replicaCmd := fmt.Sprintf("%s SENTINEL replicas %s",
+		baseCmd,
+		installerkit.ShellQuote(masterName),
+	)
+	if result, err := installerkit.Run(ctx, s.remote, sentinelServer, replicaCmd, log, "redis sentinel replicas command failed"); err == nil {
+		out.ReplicaEndpoints = parseRedisSentinelEndpointRows(result.Stdout)
+	}
+	sentinelsCmd := fmt.Sprintf("%s SENTINEL sentinels %s",
+		baseCmd,
+		installerkit.ShellQuote(masterName),
+	)
+	if result, err := installerkit.Run(ctx, s.remote, sentinelServer, sentinelsCmd, log, "redis sentinel peers command failed"); err == nil {
+		out.SentinelEndpoints = parseRedisSentinelEndpointRows(result.Stdout)
+	}
+	if strings.TrimSpace(sentinelServer.Host) != "" {
+		out.SentinelEndpoints = appendUniqueEndpoint(out.SentinelEndpoints, fmt.Sprintf("%s:%d", sentinelServer.Host, sentinelPort))
+	}
+	for _, endpoint := range append([]string{out.MasterEndpoint}, out.ReplicaEndpoints...) {
+		host, _ := splitEndpoint(endpoint)
+		if host != "" && s.probeRedisSentinelEndpoint(ctx, sentinelServer, sentinelInstance, password, host, sentinelPort) {
+			out.SentinelEndpoints = appendUniqueEndpoint(out.SentinelEndpoints, fmt.Sprintf("%s:%d", host, sentinelPort))
+		}
+	}
+	return out, nil
+}
+
+func (s Service) probeRedisSentinelEndpoint(ctx context.Context, server store.Server, instance store.AppInstance, password, host string, sentinelPort int) bool {
+	installRoot := remoteInstallRoot(server, "redis", instance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(server, "redis", instance.Version)
+	cmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -h %s -p %d --raw --no-auth-warning PING >/dev/null",
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+		installerkit.ShellQuote(password),
+		installerkit.ShellQuote(host),
+		sentinelPort,
+	)
+	_, err := s.remote.Run(ctx, server, cmd)
+	return err == nil
+}
+
+func (s Service) findRedisSentinelPeer(instance store.AppInstance) (store.AppInstance, store.Server, error) {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return store.AppInstance{}, store.Server{}, err
+	}
+	for _, candidate := range instances {
+		if !sameRedisSentinelGroup(instance, candidate) || !instanceHasSentinel(candidate) {
+			continue
+		}
+		server, err := s.store.GetServer(candidate.ServerID, true)
+		if err != nil {
+			return store.AppInstance{}, store.Server{}, err
+		}
+		return candidate, server, nil
+	}
+	return store.AppInstance{}, store.Server{}, errors.New("Redis Sentinel peer was not found")
+}
+
+func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole string, sentinelTopology redisSentinelTopology, details map[string]any, runtime redisRuntimeCheckResult) error {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	masterEndpoint := sentinelTopology.MasterEndpoint
+	masterHost, masterPort := splitEndpoint(masterEndpoint)
+	detectedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range instances {
+		if !sameRedisSentinelGroup(instance, candidate) {
+			continue
+		}
+		metadata := appMetadata(candidate)
+		metadata["currentMasterEndpoint"] = masterEndpoint
+		metadata["masterHost"] = masterHost
+		metadata["masterPort"] = masterPort
+		metadata["masterDetectedAt"] = detectedAt
+		metadata["replicaEndpoints"] = sentinelTopology.ReplicaEndpoints
+		metadata["sentinelEndpoints"] = sentinelTopology.SentinelEndpoints
+		role := metadataString(metadata, "role")
+		candidateEndpoint := s.redisInstanceEndpoint(candidate, metadata)
+		if normalizeEndpoint(candidateEndpoint) == normalizeEndpoint(masterEndpoint) {
+			role = "master"
+			metadata["role"] = role
+		} else if endpointInList(candidateEndpoint, sentinelTopology.ReplicaEndpoints) {
+			role = "replica"
+			metadata["role"] = role
+		} else if role != "sentinel" && strings.TrimSpace(candidateEndpoint) != "" {
+			role = "replica"
+			metadata["role"] = role
+		}
+		if candidate.ID == instance.ID {
+			metadata["role"] = checkedRole
+			if !runtime.Data.Checked && !runtime.Sentinel.Checked {
+				runtime.Data = redisRuntimeComponentStatus{Checked: true, Status: "running"}
+			}
+			status := runtime.aggregateStatus()
+			applyRedisRuntimeMetadata(metadata, runtime, status, details)
+			clearRecoveredInstallFailure(metadata, status)
+			candidate.Status = status
+		}
+		data, _ := json.Marshal(metadata)
+		candidate.Metadata = string(data)
+		if _, err := s.store.SaveAppInstance(candidate); err != nil {
+			return err
+		}
+	}
+	return s.ensureRedisSentinelDiscoveredInstances(instance, instances, sentinelTopology, detectedAt)
+}
+
+type discoveredRedisSentinelNode struct {
+	server            store.Server
+	role              string
+	dataEndpoint      string
+	dataPort          int
+	hasSentinel       bool
+	sentinelPort      int
+	masterHost        string
+	masterPort        int
+	masterEndpoint    string
+	replicaEndpoints  []string
+	sentinelEndpoints []string
+}
+
+func (s Service) ensureRedisSentinelDiscoveredInstances(base store.AppInstance, existing []store.AppInstance, topology redisSentinelTopology, detectedAt string) error {
+	if topology.MasterEndpoint == "" {
+		return nil
+	}
+	servers, err := s.store.ListServers()
+	if err != nil {
+		return err
+	}
+	baseMetadata := appMetadata(base)
+	existingServerIDs := map[string]bool{}
+	for _, candidate := range existing {
+		if sameRedisSentinelGroup(base, candidate) {
+			existingServerIDs[candidate.ServerID] = true
+		}
+	}
+	masterHost, masterPort := splitEndpoint(topology.MasterEndpoint)
+	discovered := map[string]*discoveredRedisSentinelNode{}
+	serverByHost := redisServersByHost(servers)
+	add := func(endpoint string) (*discoveredRedisSentinelNode, bool) {
+		host, _ := splitEndpoint(endpoint)
+		server, ok := serverByHost[normalizeRedisHost(host)]
+		if !ok || strings.TrimSpace(server.ID) == "" {
+			return nil, false
+		}
+		node := discovered[server.ID]
+		if node == nil {
+			node = &discoveredRedisSentinelNode{
+				server:            server,
+				masterHost:        masterHost,
+				masterPort:        masterPort,
+				masterEndpoint:    topology.MasterEndpoint,
+				replicaEndpoints:  topology.ReplicaEndpoints,
+				sentinelEndpoints: topology.SentinelEndpoints,
+			}
+			discovered[server.ID] = node
+		}
+		return node, true
+	}
+	if node, ok := add(topology.MasterEndpoint); ok {
+		node.role = "master"
+		node.dataEndpoint = normalizeEndpoint(topology.MasterEndpoint)
+		node.dataPort = masterPort
+	}
+	for _, endpoint := range topology.ReplicaEndpoints {
+		if node, ok := add(endpoint); ok && node.role == "" {
+			_, port := splitEndpoint(endpoint)
+			node.role = "replica"
+			node.dataEndpoint = normalizeEndpoint(endpoint)
+			node.dataPort = port
+		}
+	}
+	for _, endpoint := range topology.SentinelEndpoints {
+		if node, ok := add(endpoint); ok {
+			_, port := splitEndpoint(endpoint)
+			node.hasSentinel = true
+			node.sentinelPort = port
+		}
+	}
+	for _, node := range discovered {
+		if existingServerIDs[node.server.ID] {
+			continue
+		}
+		instance := store.AppInstance{
+			App:      "redis",
+			Version:  base.Version,
+			ServerID: node.server.ID,
+			Status:   "installed",
+			Topology: "sentinel",
+		}
+		metadata := redisDiscoveredInstanceMetadata(baseMetadata, node, detectedAt)
+		data, _ := json.Marshal(metadata)
+		instance.Metadata = string(data)
+		if _, err := s.store.SaveAppInstance(instance); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func redisDiscoveredInstanceMetadata(base map[string]any, node *discoveredRedisSentinelNode, detectedAt string) map[string]any {
+	metadata := map[string]any{}
+	for key, value := range base {
+		metadata[key] = value
+	}
+	role := node.role
+	if role == "" && node.hasSentinel {
+		role = "sentinel"
+	}
+	metadata["topology"] = "sentinel"
+	metadata["role"] = role
+	metadata["port"] = node.dataPort
+	if node.dataPort <= 0 {
+		metadata["port"] = intParam(base, "port", 6379)
+	}
+	if node.dataEndpoint != "" {
+		metadata["endpoint"] = node.dataEndpoint
+	} else {
+		delete(metadata, "endpoint")
+	}
+	if node.hasSentinel {
+		metadata["sentinel"] = true
+		metadata["sentinelName"] = "aifar-redis-sentinel"
+		metadata["sentinelPort"] = node.sentinelPort
+		if node.sentinelPort <= 0 {
+			metadata["sentinelPort"] = intParam(base, "sentinelPort", 26379)
+		}
+	} else {
+		metadata["sentinel"] = false
+		delete(metadata, "sentinelName")
+	}
+	metadata["currentMasterEndpoint"] = node.masterEndpoint
+	metadata["masterHost"] = node.masterHost
+	metadata["masterPort"] = node.masterPort
+	metadata["masterDetectedAt"] = detectedAt
+	metadata["replicaEndpoints"] = node.replicaEndpoints
+	metadata["sentinelEndpoints"] = node.sentinelEndpoints
+	return metadata
+}
+
+func redisServersByHost(servers []store.Server) map[string]store.Server {
+	out := map[string]store.Server{}
+	for _, server := range servers {
+		host := normalizeRedisHost(server.Host)
+		if host != "" {
+			out[host] = server
+		}
+	}
+	return out
+}
+
+func normalizeRedisHost(value string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(value), "[]"))
+}
+
+func parseRedisSentinelEndpointRows(stdout string) []string {
+	lines := nonEmptyLines(stdout)
+	fields := map[string]string{}
+	var endpoints []string
+	flush := func() {
+		ip := strings.TrimSpace(fields["ip"])
+		port := strings.TrimSpace(fields["port"])
+		if ip != "" && port != "" {
+			endpoints = appendUniqueEndpoint(endpoints, fmt.Sprintf("%s:%s", ip, port))
+		}
+		fields = map[string]string{}
+	}
+	for idx := 0; idx+1 < len(lines); idx += 2 {
+		key := strings.ToLower(strings.TrimSpace(lines[idx]))
+		value := strings.TrimSpace(lines[idx+1])
+		if key == "name" && len(fields) > 0 {
+			flush()
+		}
+		fields[key] = value
+	}
+	flush()
+	return endpoints
+}
+
+func appendUniqueEndpoint(endpoints []string, endpoint string) []string {
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		return endpoints
+	}
+	for _, existing := range endpoints {
+		if normalizeEndpoint(existing) == endpoint {
+			return endpoints
+		}
+	}
+	return append(endpoints, endpoint)
+}
+
+func endpointInList(endpoint string, endpoints []string) bool {
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		return false
+	}
+	for _, candidate := range endpoints {
+		if endpoint == normalizeEndpoint(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Service) redisInstanceEndpoint(instance store.AppInstance, metadata map[string]any) string {
+	if endpoint := metadataString(metadata, "endpoint"); endpoint != "" {
+		return endpoint
+	}
+	server, err := s.store.GetServer(instance.ServerID, false)
+	if err != nil || strings.TrimSpace(server.Host) == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", server.Host, intParam(metadata, "port", 6379))
+}
+
+func (s Service) markRedisInstanceStatus(instance store.AppInstance, status, role string, details map[string]any) error {
+	metadata := appMetadata(instance)
+	if role != "" {
+		metadata["role"] = role
+	}
+	if !redisStatusHealthy(status) {
+		clearRedisDiscoveredTopology(metadata)
+	}
+	metadata["lastCheck"] = map[string]any{
+		"status":    status,
+		"checkedAt": time.Now().UTC().Format(time.RFC3339),
+		"details":   details,
+	}
+	clearRecoveredInstallFailure(metadata, status)
+	data, _ := json.Marshal(metadata)
+	instance.Metadata = string(data)
+	instance.Status = status
+	_, err := s.store.SaveAppInstance(instance)
+	return err
+}
+
+func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
+	return s.markRedisInstanceStatus(instance, status, instanceRole(instance), details)
+}
+
+func redisStatusHealthy(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ok", "success", "running", "available":
+		return true
+	default:
+		return false
+	}
+}
+
+func clearRedisDiscoveredTopology(metadata map[string]any) {
+	delete(metadata, "currentMasterEndpoint")
+	delete(metadata, "replicaEndpoints")
+	delete(metadata, "sentinelEndpoints")
+	delete(metadata, "masterDetectedAt")
+}
+
+func clearRecoveredInstallFailure(metadata map[string]any, status string) {
+	if !redisStatusHealthy(status) {
+		return
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		delete(metadata, key)
+	}
+}

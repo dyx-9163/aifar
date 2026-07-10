@@ -1,0 +1,778 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"aifar-deployment/backend/internal/auth"
+	"aifar-deployment/backend/internal/config"
+	"aifar-deployment/backend/internal/realtime"
+	"aifar-deployment/backend/internal/security"
+	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/worker"
+)
+
+func TestViewerCannotMutateSettings(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "viewer", "viewer")
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/settings", strings.NewReader(`{"language":"en"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertAuditExists(t, db, "auth.permission.denied", "failed", "viewer", "settings.manage")
+}
+
+func TestOwnerCanMutateSettings(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/settings", strings.NewReader(`{"language":"en"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAlertsAreFilteredAndManagedByPermission(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	databaseAlert, _, err := db.UpsertAlert(store.Alert{
+		Fingerprint:        "app.instance:mysql-1:failed",
+		Severity:           "critical",
+		Scope:              "app.instance",
+		ResourceID:         "mysql-1",
+		App:                "mysql",
+		Title:              "MySQL instance failed",
+		RequiredPermission: "database.manage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsAlert, _, err := db.UpsertAlert(store.Alert{
+		Fingerprint:        "collector:resources.scan:failed",
+		Severity:           "warning",
+		Scope:              "collector",
+		ResourceID:         "resources.scan",
+		Title:              "Resource scan failed",
+		RequiredPermission: "settings.manage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorToken := issueTestToken(t, db, secret, "operator", "operator")
+	viewerToken := issueTestToken(t, db, secret, "viewer", "viewer")
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/alerts", nil)
+	req.Header.Set("Authorization", "Bearer "+operatorToken)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected operator alerts 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []struct {
+			ID                 string `json:"id"`
+			RequiredPermission string `json:"requiredPermission"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].ID != databaseAlert.ID || body.Items[0].RequiredPermission != "database.manage" {
+		t.Fatalf("expected operator to see only database alert, got %+v", body.Items)
+	}
+
+	viewerReq := httptest.NewRequest(http.MethodGet, "/api/v2/alerts", nil)
+	viewerReq.Header.Set("Authorization", "Bearer "+viewerToken)
+	viewerRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(viewerRec, viewerReq)
+	if viewerRec.Code != http.StatusForbidden {
+		t.Fatalf("expected viewer alerts 403, got %d body=%s", viewerRec.Code, viewerRec.Body.String())
+	}
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+databaseAlert.ID+"/ack", strings.NewReader(`{}`))
+	ackReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	ackReq.Header.Set("Content-Type", "application/json")
+	ackRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("expected operator ack 200, got %d body=%s", ackRec.Code, ackRec.Body.String())
+	}
+
+	resolveDeniedReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+databaseAlert.ID+"/resolve", strings.NewReader(`{"message":"fixed"}`))
+	resolveDeniedReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	resolveDeniedReq.Header.Set("Content-Type", "application/json")
+	resolveDeniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(resolveDeniedRec, resolveDeniedReq)
+	if resolveDeniedRec.Code != http.StatusForbidden {
+		t.Fatalf("expected operator resolve 403, got %d body=%s", resolveDeniedRec.Code, resolveDeniedRec.Body.String())
+	}
+
+	resolveReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+settingsAlert.ID+"/resolve", strings.NewReader(`{"message":"fixed"}`))
+	resolveReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	resolveReq.Header.Set("Content-Type", "application/json")
+	resolveRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(resolveRec, resolveReq)
+	if resolveRec.Code != http.StatusOK {
+		t.Fatalf("expected owner resolve 200, got %d body=%s", resolveRec.Code, resolveRec.Body.String())
+	}
+}
+
+func TestRealtimeAlertEventsArePermissionFiltered(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+	baseReq := httptest.NewRequest(http.MethodGet, "/api/v2/events", nil)
+	operatorReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "operator"}))
+	viewerReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "viewer"}))
+	ownerReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "owner"}))
+
+	databaseAlert := realtime.Event{Type: "alert.created", Payload: map[string]any{"alert": store.Alert{RequiredPermission: "database.manage"}}}
+	settingsAlert := realtime.Event{Type: "alert.created", Payload: map[string]any{"alert": store.Alert{RequiredPermission: "settings.manage"}}}
+	if !api.canSendRealtimeEvent(operatorReq, databaseAlert) {
+		t.Fatal("expected operator to receive database alert event")
+	}
+	if api.canSendRealtimeEvent(operatorReq, settingsAlert) {
+		t.Fatal("expected operator not to receive settings alert event")
+	}
+	if api.canSendRealtimeEvent(viewerReq, databaseAlert) {
+		t.Fatal("expected viewer not to receive alert event")
+	}
+	if !api.canSendRealtimeEvent(ownerReq, settingsAlert) {
+		t.Fatal("expected owner to receive all alert events")
+	}
+	if !api.canSendRealtimeEvent(viewerReq, realtime.Event{Type: "task.updated"}) {
+		t.Fatal("expected non-alert realtime events to pass through")
+	}
+}
+
+func TestContainerImageRemoveStartsTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	var gotMethod, gotPath string
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", Username: "root", DockerHost: dockerAPI.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/images/remove?serverId="+server.ID, strings.NewReader(`{"id":"repo/app:1.0"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("method = %s, want DELETE", gotMethod)
+	}
+	if gotPath != "/images/repo%2Fapp:1.0" {
+		t.Fatalf("path = %s, want escaped image path", gotPath)
+	}
+	assertAuditExists(t, db, "containers.image.remove", "running", "owner", "repo/app:1.0")
+}
+
+func TestContainerImageBatchRemoveStartsSingleTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	var mu sync.Mutex
+	var gotMethods []string
+	var gotPaths []string
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotMethods = append(gotMethods, r.Method)
+		gotPaths = append(gotPaths, r.URL.EscapedPath())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", Username: "root", DockerHost: dockerAPI.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/images/remove?serverId="+server.ID, strings.NewReader(`{"ids":["repo/app:1.0","repo/worker:2.0"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotMethods) != 2 || gotMethods[0] != http.MethodDelete || gotMethods[1] != http.MethodDelete {
+		t.Fatalf("methods = %+v, want two DELETE calls", gotMethods)
+	}
+	wantPaths := []string{"/images/repo%2Fapp:1.0", "/images/repo%2Fworker:2.0"}
+	if len(gotPaths) != len(wantPaths) {
+		t.Fatalf("paths = %+v, want %+v", gotPaths, wantPaths)
+	}
+	for i := range wantPaths {
+		if gotPaths[i] != wantPaths[i] {
+			t.Fatalf("path[%d] = %s, want %s", i, gotPaths[i], wantPaths[i])
+		}
+	}
+	assertAuditExists(t, db, "containers.image.batch.remove", "running", "owner", "repo/app:1.0,repo/worker:2.0")
+}
+
+func TestTokenIsRejectedAfterPasswordReset(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	if err := db.ResetUserPassword("owner", "new-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFailedLoginIsAudited(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(`{"username":"owner","password":"wrong-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertAuditExists(t, db, "auth.login", "failed", "owner", "owner")
+}
+
+func TestRepeatedFailedLoginIsLockedAndAudited(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	api.auth = security.NewLoginGuard(2, time.Minute)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := postLogin(api, "owner", "wrong-password")
+	if first.Code != http.StatusUnauthorized {
+		t.Fatalf("expected first failure 401, got %d body=%s", first.Code, first.Body.String())
+	}
+	second := postLogin(api, "owner", "wrong-password")
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second failure to lock with 429, got %d body=%s", second.Code, second.Body.String())
+	}
+	third := postLogin(api, "owner", "correct-password")
+	if third.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected locked login to remain 429, got %d body=%s", third.Code, third.Body.String())
+	}
+	assertAuditExists(t, db, "auth.login.locked", "failed", "owner", "owner")
+}
+
+func TestSuccessfulLoginClearsFailureCounter(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	api.auth = security.NewLoginGuard(2, time.Minute)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := postLogin(api, "owner", "wrong-password"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected first failure 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postLogin(api, "owner", "correct-password"); rec.Code != http.StatusOK {
+		t.Fatalf("expected success 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postLogin(api, "owner", "wrong-password"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected counter reset after success, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSecurityHeadersAreApplied(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	for key, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := rec.Header().Get(key); got != want {
+			t.Fatalf("expected %s=%q, got %q", key, want, got)
+		}
+	}
+	if got := rec.Header().Get("Permissions-Policy"); got == "" {
+		t.Fatalf("expected Permissions-Policy header")
+	}
+}
+
+func TestRequestBodyLimitReturnsPayloadTooLarge(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+	api.cfg.MaxRequestBodyBytes = 12
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(`{"username":"owner","password":"too-large"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHealthEndpoints(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	liveReq := httptest.NewRequest(http.MethodGet, "/api/v2/health/live", nil)
+	liveRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(liveRec, liveReq)
+	if liveRec.Code != http.StatusOK {
+		t.Fatalf("expected live 200, got %d body=%s", liveRec.Code, liveRec.Body.String())
+	}
+
+	readyReq := httptest.NewRequest(http.MethodGet, "/api/v2/health/ready", nil)
+	readyRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(readyRec, readyReq)
+	if readyRec.Code != http.StatusOK {
+		t.Fatalf("expected ready 200, got %d body=%s", readyRec.Code, readyRec.Body.String())
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v2/health", nil)
+	detailReq.Header.Set("Authorization", "Bearer "+token)
+	detailRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("expected health detail 200, got %d body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	var body struct {
+		Status     string                    `json:"status"`
+		Components map[string]map[string]any `json:"components"`
+	}
+	if err := json.Unmarshal(detailRec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "ok" || body.Components["database"]["status"] != "ok" {
+		t.Fatalf("unexpected health detail: %+v", body)
+	}
+}
+
+func TestSettingsExposeSecurityLimits(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.cfg.MaxRequestBodyBytes = 2048
+	api.cfg.AuthMaxFailures = 7
+	api.cfg.AuthLockoutSeconds = 60
+	api.cfg.AuditRetentionDays = 120
+	api.cfg.TaskRetentionDays = 45
+	api.cfg.DatabaseBackupDir = filepath.Join(t.TempDir(), "control-plane-backups")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) ||
+		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir {
+		t.Fatalf("security limits missing from settings response: %+v", body)
+	}
+}
+
+func TestUserManagementLifecycle(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v2/users", strings.NewReader(`{"username":"ops","password":"StrongPass123","role":"operator"}`))
+	createReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected create user 201, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	roleReq := httptest.NewRequest(http.MethodPut, "/api/v2/users/ops/role", strings.NewReader(`{"role":"admin"}`))
+	roleReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	roleReq.Header.Set("Content-Type", "application/json")
+	roleRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(roleRec, roleReq)
+	if roleRec.Code != http.StatusOK {
+		t.Fatalf("expected role update 200, got %d body=%s", roleRec.Code, roleRec.Body.String())
+	}
+
+	passwordReq := httptest.NewRequest(http.MethodPut, "/api/v2/users/ops/password", strings.NewReader(`{"password":"NewStrongPass123"}`))
+	passwordReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	passwordReq.Header.Set("Content-Type", "application/json")
+	passwordRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(passwordRec, passwordReq)
+	if passwordRec.Code != http.StatusOK {
+		t.Fatalf("expected password reset 200, got %d body=%s", passwordRec.Code, passwordRec.Body.String())
+	}
+
+	loginRec := postLogin(api, "ops", "NewStrongPass123")
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("expected updated user login 200, got %d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v2/users", nil)
+	listReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	listRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected list users 200, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listBody struct {
+		Items []struct {
+			Username string `json:"username"`
+			Role     string `json:"role"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	foundOps := false
+	for _, item := range listBody.Items {
+		if item.Username == "ops" && item.Role == "admin" {
+			foundOps = true
+		}
+	}
+	if !foundOps {
+		t.Fatalf("expected ops admin in user list: %+v", listBody.Items)
+	}
+
+	operatorToken := issueTestToken(t, db, secret, "operator", "operator")
+	deniedReq := httptest.NewRequest(http.MethodGet, "/api/v2/users", nil)
+	deniedReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	deniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deniedRec, deniedReq)
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("expected operator user list 403, got %d body=%s", deniedRec.Code, deniedRec.Body.String())
+	}
+
+	assertAuditExists(t, db, "users.create", "success", "owner", "ops")
+	assertAuditExists(t, db, "users.role.update", "success", "owner", "ops")
+	assertAuditExists(t, db, "users.password.reset", "success", "owner", "ops")
+	assertAuditExists(t, db, "auth.permission.denied", "failed", "operator", "users.manage")
+}
+
+func TestCannotDemoteLastOwner(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/users/owner/role", strings.NewReader(`{"role":"admin"}`))
+	req.Header.Set("Authorization", "Bearer "+ownerToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected last owner demotion 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	user, err := db.UserByUsername("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Role != "owner" {
+		t.Fatalf("expected owner role to remain owner, got %s", user.Role)
+	}
+}
+
+func TestRetentionCleanupStartsTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.cfg.AuditRetentionDays = 1
+	api.cfg.TaskRetentionDays = 1
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/retention/run", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	assertAuditExists(t, db, "maintenance.retention.run", "running", "owner", "control-plane")
+}
+
+func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/database-backup/run", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	files, err := filepath.Glob(filepath.Join(api.cfg.DatabaseBackupDir, "aifar-control-plane-*.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected one backup file, got %+v", files)
+	}
+	backup, err := store.Open(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.UserByUsername("owner"); err != nil {
+		_ = backup.Close()
+		t.Fatalf("expected backed up owner to be readable: %v", err)
+	}
+	if err := backup.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups", nil)
+	listReq.Header.Set("Authorization", "Bearer "+token)
+	listRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected backup list 200, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listBody struct {
+		Items []struct {
+			Name   string `json:"name"`
+			SHA256 string `json:"sha256"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(listBody.Items) != 1 || listBody.Items[0].Name == "" || listBody.Items[0].SHA256 == "" {
+		t.Fatalf("expected one listed backup with checksum, got %+v", listBody.Items)
+	}
+
+	verifyReq := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/database-backups/"+listBody.Items[0].Name+"/verify", nil)
+	verifyReq.Header.Set("Authorization", "Bearer "+token)
+	verifyRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(verifyRec, verifyReq)
+	if verifyRec.Code != http.StatusAccepted {
+		t.Fatalf("expected backup verify 202, got %d body=%s", verifyRec.Code, verifyRec.Body.String())
+	}
+	var verifyBody map[string]any
+	if err := json.Unmarshal(verifyRec.Body.Bytes(), &verifyBody); err != nil {
+		t.Fatal(err)
+	}
+	verifyTaskID, _ := verifyBody["taskId"].(string)
+	if verifyTaskID == "" {
+		t.Fatalf("expected verify taskId in response: %+v", verifyBody)
+	}
+	waitForTaskStatus(t, db, verifyTaskID, "success")
+
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups/"+listBody.Items[0].Name+"/download", nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+token)
+	downloadRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Code != http.StatusOK {
+		t.Fatalf("expected backup download 200, got %d body=%s", downloadRec.Code, downloadRec.Body.String())
+	}
+	if downloadRec.Body.Len() == 0 || downloadRec.Header().Get("X-AIFAR-Backup-SHA256") == "" {
+		t.Fatalf("expected backup download body and checksum header")
+	}
+	badDownloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups/other.db/download", nil)
+	badDownloadReq.Header.Set("Authorization", "Bearer "+token)
+	badDownloadRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(badDownloadRec, badDownloadReq)
+	if badDownloadRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe backup download 400, got %d body=%s", badDownloadRec.Code, badDownloadRec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/maintenance/database-backups", strings.NewReader(`{"names":["`+listBody.Items[0].Name+`"]}`))
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteReq.Header.Set("Content-Type", "application/json")
+	deleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected backup delete 200, got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Fatalf("expected backup file to be deleted, got %v", err)
+	}
+	badDeleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/maintenance/database-backups", strings.NewReader(`{"names":["../aifar-control-plane-bad.db"]}`))
+	badDeleteReq.Header.Set("Authorization", "Bearer "+token)
+	badDeleteReq.Header.Set("Content-Type", "application/json")
+	badDeleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(badDeleteRec, badDeleteReq)
+	if badDeleteRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe backup delete 400, got %d body=%s", badDeleteRec.Code, badDeleteRec.Body.String())
+	}
+	assertAuditExists(t, db, "maintenance.database.backup", "running", "owner", "control-plane")
+	assertAuditExists(t, db, "maintenance.database.backup.verify", "running", "owner", listBody.Items[0].Name)
+	assertAuditExists(t, db, "maintenance.database.backup.delete", "success", "owner", listBody.Items[0].Name)
+}
+
+func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
+	t.Helper()
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	secret := "test-secret"
+	cfg := config.Config{
+		JWTSecret:             secret,
+		ResourceDir:           filepath.Join(root, "resources"),
+		StaticDir:             root,
+		DatabasePath:          filepath.Join(root, "aifar.db"),
+		DatabaseBackupDir:     filepath.Join(root, "backups"),
+		DefaultDeployDir:      "/aifar/apps",
+		DeploymentConcurrency: 1,
+		ProviderMode:          "real",
+		MaxRequestBodyBytes:   1 << 20,
+		AuthMaxFailures:       5,
+		AuthLockoutSeconds:    300,
+		AuditRetentionDays:    180,
+		TaskRetentionDays:     90,
+	}
+	return New(cfg, db, worker.NewManager(db)), db, secret
+}
+
+func issueTestToken(t *testing.T, db *store.Store, secret, username, role string) string {
+	t.Helper()
+	if err := db.ResetUserPassword(username, "password"); err != nil {
+		t.Fatal(err)
+	}
+	if role != "owner" {
+		if err := db.SetUserRole(username, role); err != nil {
+			t.Fatal(err)
+		}
+	}
+	user, err := db.UserByUsername(username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := auth.IssueToken(secret, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+func assertAuditExists(t *testing.T, db *store.Store, action, status, actor, target string) {
+	t.Helper()
+	items, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Action == action && item.Status == status && item.Actor == actor && item.Target == target {
+			return
+		}
+	}
+	t.Fatalf("expected audit action=%s status=%s actor=%s target=%s in %+v", action, status, actor, target, items)
+}
+
+func postLogin(api *API, username, password string) *httptest.ResponseRecorder {
+	body := `{"username":"` + username + `","password":"` + password + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	return rec
+}
+
+func waitForTaskStatus(t *testing.T, db *store.Store, taskID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		task, _, err := db.GetTask(taskID)
+		if err == nil && task.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	task, _, err := db.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("task %s not found while waiting for status %s: %v", taskID, want, err)
+	}
+	t.Fatalf("expected task %s status %s, got %s", taskID, want, task.Status)
+}

@@ -1,0 +1,289 @@
+package mysql
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/store"
+)
+
+type Module struct {
+	service         Service
+	defaultPassword string
+}
+
+func init() {
+	registry.RegisterFactory("mysql", func(deps registry.Dependencies) registry.Module {
+		return NewModule(deps.Store, adapter.SSHRemote{}, deps.DefaultPassword)
+	})
+}
+
+func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
+	password := ""
+	if len(defaultPassword) > 0 {
+		password = defaultPassword[0]
+	}
+	return Module{service: NewService(s, remote), defaultPassword: password}
+}
+
+func (m Module) Name() string {
+	return "mysql"
+}
+
+func (m Module) Manifest(lang string) registry.Manifest {
+	copy := CopyFor(lang)
+	return registry.Manifest{
+		Name:                "mysql",
+		Title:               "MySQL",
+		Icon:                "MY",
+		Category:            "database",
+		CategoryLabel:       copy.CategoryLabel,
+		SourceLabel:         copy.SourceLabel,
+		Description:         copy.Description,
+		InstallName:         "mysql",
+		ResourceApp:         "mysql",
+		RequiresServer:      true,
+		SupportsMultiTarget: true,
+		BackendReady:        true,
+		RequiredResourceParts: []string{
+			"backend",
+		},
+		Topologies: mysqlTopologies(lang),
+		Capabilities: []string{
+			"apps.mysql.install",
+			"apps.mysql.delete",
+			"apps.mysql-router.install",
+			"apps.mysql.cluster.start",
+			"resources.mysql.verify",
+			"databases.mysql.register",
+		},
+	}
+}
+
+func mysqlTopologies(lang string) []registry.Topology {
+	if normalizeLanguage(lang) == "en" {
+		return []registry.Topology{
+			{Name: "standalone", Label: "Standalone", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+			{Name: "innodb-cluster", Label: "InnoDB Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
+		}
+	}
+	return []registry.Topology{
+		{Name: "standalone", Label: "单体", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+		{Name: "innodb-cluster", Label: "InnoDB Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
+	}
+}
+
+func (m Module) PreflightInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) (registry.PreflightResult, error) {
+	if ctx.Err() != nil {
+		return registry.PreflightResult{}, ctx.Err()
+	}
+	bundle, err := SelectBundle(resources, req.Version)
+	if err != nil {
+		return registry.PreflightResult{}, err
+	}
+	var warnings []string
+	if len(bundle.RPMPaths) == 0 {
+		warnings = append(warnings, CopyFor(req.Language).MissingRPMWarning)
+	}
+	return registry.PreflightResult{Warnings: warnings}, nil
+}
+
+func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := CopyFor(req.Language)
+	topology := normalizeTopology(req.Topology)
+	steps := mysqlInstallStepsFor(topology, copy)
+	targets := req.TargetServerIDs()
+	if topology == "innodb-cluster" {
+		targets = mysqlClusterServerIDs(req.Parameters, targets)
+	}
+	plan := make([]registry.InstallStepPlan, 0, len(targets)*len(steps))
+	for targetIdx, target := range targets {
+		for idx, step := range steps {
+			if topology == "innodb-cluster" && step.Name == "bootstrap-cluster" && targetIdx != 0 {
+				continue
+			}
+			plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+		}
+	}
+	if topology == "innodb-cluster" && mysqlRouterEnabled(req.Parameters) {
+		mysqlTargetSet := map[string]bool{}
+		for _, target := range targets {
+			mysqlTargetSet[target] = true
+		}
+		routerSteps := mysqlIntegratedRouterSteps(copy)
+		for _, target := range mysqlRouterServerIDs(req.Parameters, targets) {
+			offset := 0
+			if mysqlTargetSet[target] {
+				offset = len(steps)
+			}
+			for idx, step := range routerSteps {
+				plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: offset + idx + 1})
+			}
+		}
+	}
+	return plan, nil
+}
+
+func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	copy := CopyFor(req.Language)
+	requestedTargets := req.TargetServerIDs()
+	if len(requestedTargets) == 0 {
+		return errors.New(copy.TargetRequired)
+	}
+	topology := normalizeTopology(req.Topology)
+	switch topology {
+	case "standalone":
+		if len(requestedTargets) > 1 {
+			return errors.New(copy.SingleTargetOnly)
+		}
+	case "innodb-cluster":
+		targets := mysqlClusterServerIDs(req.Parameters, requestedTargets)
+		if len(targets) < 3 {
+			return errors.New(copy.ClusterNeedNodes)
+		}
+		if mysqlRouterEnabled(req.Parameters) {
+			if len(mysqlRouterServerIDs(req.Parameters, targets)) == 0 {
+				return errors.New(copy.RouterTargetsRequired)
+			}
+			basePort := mysqlRouterBasePort(req.Parameters)
+			if basePort <= 0 || basePort+3 > 65535 {
+				return fmt.Errorf("invalid MySQL Router base port: %d", basePort)
+			}
+		}
+	default:
+		return fmt.Errorf(copy.ClusterUnsupported, topology)
+	}
+	bundle, err := SelectBundle(resources, req.Version)
+	if err != nil {
+		return err
+	}
+	if err := VerifyBundle(bundle); err != nil {
+		return err
+	}
+	return mysqlOptions(req.Parameters, req.DefaultPassword).Validate()
+}
+
+func (m Module) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
+	return m.service.Install(ctx, InstallRequest{
+		Version:         req.Version,
+		Topology:        req.Topology,
+		Language:        req.Language,
+		ServerID:        req.ServerID,
+		ServerIDs:       req.ServerIDs,
+		DefaultPassword: req.DefaultPassword,
+		Parameters:      req.Parameters,
+		Concurrency:     run.Concurrency,
+	}, run.Resources, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) PlanDelete(ctx context.Context, req registry.DeleteRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := DeleteCopyFor(req.Language)
+	steps := mysqlDeleteSteps(copy)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run registry.RunContext) error {
+	if !registry.DeleteConfirmedWithServerPassword(req) {
+		return errors.New(i18n.Text(req.Language, "api.deleteRequiresServerPasswordConfirmation"))
+	}
+	return m.service.Delete(ctx, DeleteRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) PlanCheck(ctx context.Context, req registry.CheckRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := CheckCopyFor(req.Language)
+	steps := mysqlCheckStepsFor(instanceTopology(req.Instance), copy)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
+	result, err := m.service.Check(ctx, CheckRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		DefaultPassword: m.defaultPassword,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
+}
+
+func (m Module) PlanClusterStart(ctx context.Context, req registry.ClusterStartRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := ClusterStartCopyFor(req.Language)
+	nodes, err := m.service.clusterStartNodes(StartClusterRequest{
+		Instances:       req.Instances,
+		Servers:         req.Servers,
+		Language:        req.Language,
+		DefaultPassword: req.DefaultPassword,
+	}, copy)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	target := nodes[0].server.ID
+	steps := mysqlClusterStartSteps(copy)
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) StartCluster(ctx context.Context, req registry.ClusterStartRequest, run registry.RunContext) error {
+	defaultPassword := m.defaultPassword
+	if defaultPassword == "" {
+		defaultPassword = req.DefaultPassword
+	}
+	return m.service.StartInnoDBCluster(ctx, StartClusterRequest{
+		Instances:       req.Instances,
+		Servers:         req.Servers,
+		Language:        req.Language,
+		DefaultPassword: defaultPassword,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
