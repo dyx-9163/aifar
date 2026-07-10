@@ -59,6 +59,7 @@ const navItems = computed(() => allNavItems.filter((item) => !item.permission ||
 const allNavItems: Array<{ path: string; labelKey: string; icon: Component; permission?: Permission }> = [
   { path: '/dashboard', labelKey: 'nav.dashboard', icon: Odometer },
   { path: '/apps', labelKey: 'nav.apps', icon: Shop },
+  { path: '/orchestration', labelKey: 'nav.orchestration', icon: Operation, permission: permissions.orchestrationManage },
   { path: '/servers', labelKey: 'nav.servers', icon: Monitor },
   { path: '/containers', labelKey: 'nav.containers', icon: Box },
   { path: '/database', labelKey: 'nav.database', icon: Coin },

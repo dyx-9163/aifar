@@ -1,0 +1,190 @@
+{
+  "apiVersion": "aifar.io/v1alpha2",
+  "kind": "ActionPackage",
+  "name": "mysql-innodb-cluster",
+  "version": "1.0.0",
+  "title": {
+    "zh": "MySQL 8.0.36 三节点 InnoDB Cluster",
+    "en": "MySQL 8.0.36 Three-node InnoDB Cluster"
+  },
+  "description": {
+    "zh": "在三台 openEuler 24.03 SP3 服务器上离线安装 MySQL，经过节点屏障后创建 InnoDB Cluster，并在协调节点部署 MySQL Router。",
+    "en": "Offline-install MySQL on three openEuler 24.03 SP3 servers, create an InnoDB Cluster after a node barrier, and deploy MySQL Router on the coordinator."
+  },
+  "actions": [
+    {
+      "name": "install-cluster",
+      "title": {
+        "zh": "安装三节点 MySQL 集群",
+        "en": "Install three-node MySQL cluster"
+      },
+      "description": {
+        "zh": "并行准备三台节点，统一建群并验证 Router 入口。",
+        "en": "Prepare three nodes in parallel, bootstrap the cluster, and verify the Router endpoint."
+      },
+      "operation": "install",
+      "targetMode": "cluster",
+      "topology": "mysql-innodb-cluster",
+      "minTargets": 3,
+      "maxTargets": 3,
+      "readOnly": false,
+      "timeoutSeconds": 3600,
+      "secrets": [
+        {
+          "name": "mysql-admin-password",
+          "env": "AIFAR_MYSQL_ADMIN_PASSWORD",
+          "generator": "hex",
+          "bytes": 24
+        }
+      ],
+      "credential": {
+        "kind": "database",
+        "username": "aifar_cluster_admin",
+        "purpose": "cluster-admin",
+        "secretName": "mysql-admin-password",
+        "secretKey": "password"
+      },
+      "result": {
+        "app": "mysql",
+        "version": "8.0.36",
+        "status": "installed",
+        "port": 3306
+      },
+      "phases": [
+        {
+          "name": "preflight-nodes",
+          "title": {
+            "zh": "节点预检查",
+            "en": "Node preflight"
+          },
+          "scope": "node",
+          "mode": "parallel",
+          "steps": [
+            {
+              "name": "check-connection",
+              "title": {
+                "zh": "检查节点连接与角色上下文",
+                "en": "Check node connection and role context"
+              },
+              "script": "scripts/01-check-connection.sh",
+              "readOnly": true,
+              "timeoutSeconds": 60
+            },
+            {
+              "name": "check-system",
+              "title": {
+                "zh": "检查系统与离线资源",
+                "en": "Check system and offline resources"
+              },
+              "script": "scripts/02-check-system.sh",
+              "readOnly": true,
+              "timeoutSeconds": 180
+            }
+          ]
+        },
+        {
+          "name": "prepare-nodes",
+          "title": {
+            "zh": "并行准备 MySQL 节点",
+            "en": "Prepare MySQL nodes in parallel"
+          },
+          "scope": "node",
+          "mode": "parallel",
+          "steps": [
+            {
+              "name": "open-firewall",
+              "title": {
+                "zh": "开放 MySQL 与 Group Replication 端口",
+                "en": "Open MySQL and Group Replication ports"
+              },
+              "script": "scripts/03-open-firewall.sh",
+              "readOnly": false,
+              "timeoutSeconds": 180
+            },
+            {
+              "name": "install-node",
+              "title": {
+                "zh": "安装并配置 MySQL 节点",
+                "en": "Install and configure MySQL node"
+              },
+              "script": "scripts/04-install-node.sh",
+              "readOnly": false,
+              "timeoutSeconds": 1800
+            }
+          ]
+        },
+        {
+          "name": "nodes-ready",
+          "title": {
+            "zh": "等待三台节点就绪",
+            "en": "Wait for all three nodes"
+          },
+          "scope": "barrier"
+        },
+        {
+          "name": "bootstrap-cluster",
+          "title": {
+            "zh": "创建 InnoDB Cluster",
+            "en": "Bootstrap InnoDB Cluster"
+          },
+          "scope": "cluster",
+          "runOn": "coordinator",
+          "steps": [
+            {
+              "name": "bootstrap-cluster",
+              "title": {
+                "zh": "配置实例并添加集群成员",
+                "en": "Configure instances and add cluster members"
+              },
+              "script": "scripts/05-bootstrap-cluster.sh",
+              "readOnly": false,
+              "timeoutSeconds": 1800
+            }
+          ]
+        },
+        {
+          "name": "install-router",
+          "title": {
+            "zh": "部署 MySQL Router",
+            "en": "Deploy MySQL Router"
+          },
+          "scope": "cluster",
+          "runOn": "coordinator",
+          "steps": [
+            {
+              "name": "install-router",
+              "title": {
+                "zh": "引导并启动 Router 服务",
+                "en": "Bootstrap and start the Router service"
+              },
+              "script": "scripts/06-install-router.sh",
+              "readOnly": false,
+              "timeoutSeconds": 600
+            }
+          ]
+        },
+        {
+          "name": "verify-cluster",
+          "title": {
+            "zh": "集群验收",
+            "en": "Cluster acceptance"
+          },
+          "scope": "cluster",
+          "runOn": "coordinator",
+          "steps": [
+            {
+              "name": "verify-cluster",
+              "title": {
+                "zh": "验证三节点 ONLINE 与 Router 入口",
+                "en": "Verify three ONLINE members and Router"
+              },
+              "script": "scripts/07-verify-cluster.sh",
+              "readOnly": true,
+              "timeoutSeconds": 300
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

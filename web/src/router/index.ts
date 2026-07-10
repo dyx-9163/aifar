@@ -4,6 +4,7 @@ import { normalizePermissions, permissions } from '../rbac'
 const LoginView = () => import('../views/LoginView.vue')
 const DashboardView = () => import('../views/DashboardView.vue')
 const AppsView = () => import('../views/AppsView.vue')
+const OrchestrationView = () => import('../views/OrchestrationView.vue')
 const ContainersView = () => import('../views/ContainersView.vue')
 const ServersView = () => import('../views/ServersView.vue')
 const DatabaseView = () => import('../views/DatabaseView.vue')
@@ -23,6 +24,7 @@ const router = createRouter({
     { path: '/', redirect: '/dashboard' },
     { path: '/dashboard', component: DashboardView },
     { path: '/apps', component: AppsView },
+    { path: '/orchestration', component: OrchestrationView, meta: { permission: permissions.orchestrationManage } },
     { path: '/containers', component: ContainersView },
     { path: '/servers', component: ServersView },
     { path: '/database', component: DatabaseView },

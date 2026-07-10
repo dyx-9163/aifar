@@ -1,0 +1,65 @@
+{
+  "apiVersion": "aifar.io/v1alpha1",
+  "kind": "ActionPackage",
+  "name": "mysql-offline-standalone",
+  "version": "1.0.3",
+  "title": {
+    "zh": "MySQL 8.0.36 离线单机安装",
+    "en": "MySQL 8.0.36 Offline Standalone Install"
+  },
+  "description": {
+    "zh": "检查服务器连接和系统参数，开放 3306/tcp，并使用官方离线二进制包安装 MySQL。",
+    "en": "Check connectivity and system prerequisites, open 3306/tcp, and install MySQL from the official offline binary bundle."
+  },
+  "actions": [
+    {
+      "name": "install-mysql",
+      "operation": "install",
+      "targetMode": "single",
+      "readOnly": false,
+      "timeoutSeconds": 1800,
+      "steps": [
+        {
+          "name": "check-connection",
+          "title": {
+            "zh": "检查服务器连接状态",
+            "en": "Check server connectivity"
+          },
+          "script": "scripts/01-check-connection.sh",
+          "readOnly": true,
+          "timeoutSeconds": 60
+        },
+        {
+          "name": "check-system",
+          "title": {
+            "zh": "检查系统参数",
+            "en": "Check system prerequisites"
+          },
+          "script": "scripts/02-check-system.sh",
+          "readOnly": true,
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "open-firewall",
+          "title": {
+            "zh": "开放防火墙端口",
+            "en": "Open firewall port"
+          },
+          "script": "scripts/03-open-firewall.sh",
+          "readOnly": false,
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "install-mysql",
+          "title": {
+            "zh": "安装并验证 MySQL",
+            "en": "Install and verify MySQL"
+          },
+          "script": "scripts/04-install-mysql.sh",
+          "readOnly": false,
+          "timeoutSeconds": 1800
+        }
+      ]
+    }
+  ]
+}

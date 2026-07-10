@@ -3,6 +3,9 @@ import { getCurrentLocale } from '../i18n'
 export type ApiError = Error & { status?: number; details?: unknown }
 
 const API_PREFIX = '/api/v2'
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const MUTATION_REQUEST_TIMEOUT_MS = 30_000
+const TRANSFER_REQUEST_TIMEOUT_MS = 600_000
 
 function headers(json = true) {
   const out = new Headers()
@@ -36,31 +39,31 @@ function clearLocalSession() {
 }
 
 export function apiGet<T>(path: string) {
-  return fetch(`${API_PREFIX}${path}`, { headers: headers(false) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
+  return fetchWithTimeout(`${API_PREFIX}${path}`, { headers: headers(false) }, DEFAULT_REQUEST_TIMEOUT_MS).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPost<T>(path: string, body?: unknown) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
+  return fetchWithTimeout(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(), body: JSON.stringify(body ?? {}) }, MUTATION_REQUEST_TIMEOUT_MS).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPostForm<T>(path: string, body: FormData) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(false), body }).then((r) => handle<T>(r)).catch(rethrowFetchError)
+  return fetchWithTimeout(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(false), body }, TRANSFER_REQUEST_TIMEOUT_MS).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPut<T>(path: string, body?: unknown) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'PUT', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
+  return fetchWithTimeout(`${API_PREFIX}${path}`, { method: 'PUT', headers: headers(), body: JSON.stringify(body ?? {}) }, MUTATION_REQUEST_TIMEOUT_MS).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiDelete<T>(path: string, body?: unknown) {
-  return fetch(`${API_PREFIX}${path}`, {
+  return fetchWithTimeout(`${API_PREFIX}${path}`, {
     method: 'DELETE',
     headers: headers(body !== undefined),
     body: body === undefined ? undefined : JSON.stringify(body)
-  }).then((r) => handle<T>(r)).catch(rethrowFetchError)
+  }, MUTATION_REQUEST_TIMEOUT_MS).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export async function apiDownload(path: string) {
-  const response = await fetch(`${API_PREFIX}${path}`, { headers: headers(false) })
+  const response = await fetchWithTimeout(`${API_PREFIX}${path}`, { headers: headers(false) }, TRANSFER_REQUEST_TIMEOUT_MS)
   if (!response.ok) {
     await handle<unknown>(response)
   }
@@ -77,10 +80,19 @@ export function asArray<T = unknown>(value: unknown): T[] {
 
 function rethrowFetchError(err: unknown): never {
   const message = err instanceof Error ? err.message : String(err)
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    throw new Error(networkErrorMessage())
+  }
   if (err instanceof TypeError && /fetch|network|failed/i.test(message)) {
     throw new Error(networkErrorMessage())
   }
   throw err
+}
+
+function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => window.clearTimeout(timer))
 }
 
 function networkErrorMessage() {

@@ -5,27 +5,28 @@ import "strings"
 type Permission string
 
 const (
-	SettingsManage    Permission = "settings.manage"
-	UsersManage       Permission = "users.manage"
-	ResourcesScan     Permission = "resources.scan"
-	ServersManage     Permission = "servers.manage"
-	TerminalConnect   Permission = "terminal.connect"
-	TasksManage       Permission = "tasks.manage"
-	AuditManage       Permission = "audit.manage"
-	AppsManage        Permission = "apps.manage"
-	ContainersManage  Permission = "containers.manage"
-	DatabaseManage    Permission = "database.manage"
-	StorageManage     Permission = "storage.manage"
-	AlertsView        Permission = "alerts.view"
-	AlertsManage      Permission = "alerts.manage"
-	CredentialsUse    Permission = "credentials.use"
-	CredentialsManage Permission = "credentials.manage"
+	SettingsManage      Permission = "settings.manage"
+	UsersManage         Permission = "users.manage"
+	ResourcesScan       Permission = "resources.scan"
+	ServersManage       Permission = "servers.manage"
+	TerminalConnect     Permission = "terminal.connect"
+	TasksManage         Permission = "tasks.manage"
+	AuditManage         Permission = "audit.manage"
+	AppsManage          Permission = "apps.manage"
+	OrchestrationManage Permission = "orchestration.manage"
+	ContainersManage    Permission = "containers.manage"
+	DatabaseManage      Permission = "database.manage"
+	StorageManage       Permission = "storage.manage"
+	AlertsView          Permission = "alerts.view"
+	AlertsManage        Permission = "alerts.manage"
+	CredentialsUse      Permission = "credentials.use"
+	CredentialsManage   Permission = "credentials.manage"
 )
 
 var rolePermissions = map[string]map[Permission]struct{}{
 	"owner":    allPermissions(),
 	"admin":    allPermissions(),
-	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, ContainersManage, DatabaseManage, StorageManage, AlertsView, CredentialsUse),
+	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, OrchestrationManage, ContainersManage, DatabaseManage, StorageManage, AlertsView, CredentialsUse),
 	"viewer":   permissionSet(),
 	"auditor":  permissionSet(),
 }
@@ -77,6 +78,7 @@ func allPermissions() map[Permission]struct{} {
 		TasksManage,
 		AuditManage,
 		AppsManage,
+		OrchestrationManage,
 		ContainersManage,
 		DatabaseManage,
 		StorageManage,

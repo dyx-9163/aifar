@@ -1,0 +1,88 @@
+{
+    "name":  "mysql-offline-standalone",
+    "version":  "1.0.3",
+    "platform":  "openEuler 24.03 SP3 x86_64",
+    "generatedAt":  "2026-07-10T07:09:23.6841208Z",
+    "files":  [
+                  {
+                      "path":  "deployspec.json",
+                      "sha256":  "a834fd537e05fa2e1c91d3c3536454cb05533abf21b29258c45645a1fe1d46e2",
+                      "size":  1880
+                  },
+                  {
+                      "path":  "files/mysql-aifar-8.0.36-official-bundle.tar",
+                      "sha256":  "d25a429c556f8b5539ec326fa8847cbd3d8b79a0ee49818dc5bf7951cddde6f9",
+                      "size":  160337920
+                  },
+                  {
+                      "path":  "files/RPM-GPG-KEY-openEuler",
+                      "sha256":  "006e79d37c10e74c24df6d07c4efc4176515cec009daa5ed493b06f5b6ef39c1",
+                      "size":  3033
+                  },
+                  {
+                      "path":  "README.md",
+                      "sha256":  "97984579f9e3e5bf3e0e73152141f26d6bb4c60053cb03c41d80d61f945631c9",
+                      "size":  3118
+                  },
+                  {
+                      "path":  "rpms/libaio-0.3.113-10.oe2403sp3.x86_64.rpm",
+                      "sha256":  "8b04ee4f5131d1ffbdc7bc44680635de766a21d887d85d57c3822f5502e3181e",
+                      "size":  19381
+                  },
+                  {
+                      "path":  "rpms/ncurses-6.4-12.oe2403sp3.x86_64.rpm",
+                      "sha256":  "32a75ad5811a5635fba8bbb67410e7477a2066872a190ce1245e30ed7e5438c6",
+                      "size":  702233
+                  },
+                  {
+                      "path":  "rpms/ncurses-base-6.4-12.oe2403sp3.noarch.rpm",
+                      "sha256":  "a8d8d5b2faf26e62ee9abc01d4511515113365c02b721c276bbe3533d66732ca",
+                      "size":  51621
+                  },
+                  {
+                      "path":  "rpms/ncurses-compat-libs-6.4-12.oe2403sp3.x86_64.rpm",
+                      "sha256":  "171f9c06f4b8ad27e563dceb43dd1f4f481033a8e4d4509a77f3296c668c5370",
+                      "size":  292641
+                  },
+                  {
+                      "path":  "rpms/ncurses-libs-6.4-12.oe2403sp3.x86_64.rpm",
+                      "sha256":  "745a6127f8f90725163c73d95cab31016a0aee8cfcce38ea3c4ffdad262d1069",
+                      "size":  296093
+                  },
+                  {
+                      "path":  "rpms/numactl-libs-2.0.16-14.oe2403sp3.x86_64.rpm",
+                      "sha256":  "05134ed2617fb11d0e059e340bb27181473c0075715a1adec95c7052fa004529",
+                      "size":  26113
+                  },
+                  {
+                      "path":  "rpms/tar-1.35-3.oe2403sp3.x86_64.rpm",
+                      "sha256":  "3127ce701922531f43b1315355980c47b5e57153653a181966fd5abf5aed835a",
+                      "size":  776497
+                  },
+                  {
+                      "path":  "rpms/xz-5.4.7-8.oe2403sp3.x86_64.rpm",
+                      "sha256":  "f91104ba8bd5ca729cfb61334a147a76b253f839a589b63946914b75b841d9cb",
+                      "size":  328581
+                  },
+                  {
+                      "path":  "scripts/01-check-connection.sh",
+                      "sha256":  "cfade7cabd0631900b13c537b6313e94cec9fe03f50c39e6e21c54455638ac12",
+                      "size":  818
+                  },
+                  {
+                      "path":  "scripts/02-check-system.sh",
+                      "sha256":  "b3e424246bead2d8912257945ca673fe32cafe9839ca4d950835ccc55b92b037",
+                      "size":  3474
+                  },
+                  {
+                      "path":  "scripts/03-open-firewall.sh",
+                      "sha256":  "4fe2258cb42ec980be943457268523e77eec7ee50f3d258eff6111399afee52f",
+                      "size":  1339
+                  },
+                  {
+                      "path":  "scripts/04-install-mysql.sh",
+                      "sha256":  "d268b6f18bc1e7ac2e7b5e9ec8342fed284c06bbb615806b768516aba0db5c47",
+                      "size":  11315
+                  }
+              ]
+}

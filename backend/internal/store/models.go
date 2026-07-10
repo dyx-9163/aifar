@@ -147,6 +147,100 @@ type AppRelease struct {
 	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
 }
 
+type OrchestrationPackage struct {
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	Version         string    `json:"version"`
+	TitleJSON       string    `json:"titleJson"`
+	DescriptionJSON string    `json:"descriptionJson"`
+	Status          string    `json:"status"`
+	PackagePath     string    `json:"packagePath"`
+	PackageDir      string    `json:"packageDir"`
+	PackageSHA256   string    `json:"packageSha256"`
+	SpecJSON        string    `json:"specJson"`
+	SourceFilename  string    `json:"sourceFilename"`
+	UploadedBy      string    `json:"uploadedBy"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	PublishedAt     time.Time `json:"publishedAt,omitempty"`
+}
+
+type OrchestrationAction struct {
+	ID              string                    `json:"id"`
+	PackageID       string                    `json:"packageId"`
+	Name            string                    `json:"name"`
+	TitleJSON       string                    `json:"titleJson"`
+	DescriptionJSON string                    `json:"descriptionJson"`
+	Operation       string                    `json:"operation"`
+	ScriptPath      string                    `json:"scriptPath"`
+	ScriptSHA256    string                    `json:"scriptSha256"`
+	TargetMode      string                    `json:"targetMode"`
+	Topology        string                    `json:"topology,omitempty"`
+	MinTargets      int                       `json:"minTargets"`
+	MaxTargets      int                       `json:"maxTargets"`
+	ReadOnly        bool                      `json:"readOnly"`
+	TimeoutSeconds  int                       `json:"timeoutSeconds"`
+	StagesJSON      string                    `json:"stagesJson"`
+	WorkflowJSON    string                    `json:"workflowJson"`
+	CreatedAt       time.Time                 `json:"createdAt"`
+	UpdatedAt       time.Time                 `json:"updatedAt"`
+	Steps           []OrchestrationActionStep `json:"steps,omitempty"`
+}
+
+type OrchestrationActionStep struct {
+	ID             string    `json:"id"`
+	ActionID       string    `json:"actionId"`
+	Name           string    `json:"name"`
+	TitleJSON      string    `json:"titleJson"`
+	ScriptPath     string    `json:"scriptPath"`
+	ScriptSHA256   string    `json:"scriptSha256"`
+	ReadOnly       bool      `json:"readOnly"`
+	TimeoutSeconds int       `json:"timeoutSeconds"`
+	Order          int       `json:"order"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+type OrchestrationPackageWithActions struct {
+	Package OrchestrationPackage  `json:"package"`
+	Actions []OrchestrationAction `json:"actions"`
+}
+
+type OrchestrationActionWithPackage struct {
+	Action  OrchestrationAction  `json:"action"`
+	Package OrchestrationPackage `json:"package"`
+}
+
+type OrchestrationCluster struct {
+	ID                  string                     `json:"id"`
+	ActionID            string                     `json:"actionId"`
+	PackageName         string                     `json:"packageName"`
+	PackageVersion      string                     `json:"packageVersion"`
+	Name                string                     `json:"name"`
+	Topology            string                     `json:"topology"`
+	Status              string                     `json:"status"`
+	CoordinatorServerID string                     `json:"coordinatorServerId"`
+	TaskID              string                     `json:"taskId"`
+	CredentialID        string                     `json:"credentialId,omitempty"`
+	MetadataJSON        string                     `json:"metadataJson,omitempty"`
+	CreatedAt           time.Time                  `json:"createdAt"`
+	UpdatedAt           time.Time                  `json:"updatedAt"`
+	Nodes               []OrchestrationClusterNode `json:"nodes"`
+}
+
+type OrchestrationClusterNode struct {
+	ID           string    `json:"id"`
+	ClusterID    string    `json:"clusterId"`
+	ServerID     string    `json:"serverId"`
+	Role         string    `json:"role"`
+	Endpoint     string    `json:"endpoint,omitempty"`
+	Status       string    `json:"status"`
+	Order        int       `json:"order"`
+	MetadataJSON string    `json:"metadataJson,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
 type AIFARDeployment struct {
 	ID               string    `json:"id"`
 	InstanceID       string    `json:"instanceId"`

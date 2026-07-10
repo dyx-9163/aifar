@@ -186,6 +186,53 @@ func (s *Store) migrate() error {
 			config_hash text, created_at datetime not null, activated_at datetime
 		)`,
 		`create unique index if not exists app_releases_instance_release on app_releases(instance_id, release_id)`,
+		`create table if not exists orchestration_packages (
+			id text primary key, name text not null, version text not null,
+			title_json text not null, description_json text not null,
+			status text not null, package_path text not null, package_dir text not null,
+			package_sha256 text not null, spec_json text not null,
+			source_filename text, uploaded_by text,
+			created_at datetime not null, updated_at datetime not null, published_at datetime,
+			unique(name, version)
+		)`,
+		`create index if not exists orchestration_packages_status on orchestration_packages(status, name, version)`,
+		`create table if not exists orchestration_actions (
+			id text primary key, package_id text not null, name text not null,
+			title_json text not null, description_json text not null,
+			operation text not null, script_path text not null, script_sha256 text not null,
+			target_mode text not null, topology text not null default '',
+			min_targets integer not null default 1, max_targets integer not null default 0,
+			read_only integer not null, timeout_seconds integer not null,
+			stages_json text not null, workflow_json text not null default '{}',
+			created_at datetime not null, updated_at datetime not null,
+			unique(package_id, name)
+		)`,
+		`create index if not exists orchestration_actions_package on orchestration_actions(package_id)`,
+		`create table if not exists orchestration_action_steps (
+			id text primary key, action_id text not null, name text not null,
+			title_json text not null, script_path text not null, script_sha256 text not null,
+			read_only integer not null, timeout_seconds integer not null, step_order integer not null,
+			created_at datetime not null, updated_at datetime not null,
+			unique(action_id, name)
+		)`,
+		`create index if not exists orchestration_action_steps_action on orchestration_action_steps(action_id, step_order)`,
+		`create table if not exists orchestration_clusters (
+			id text primary key, action_id text not null,
+			package_name text not null, package_version text not null,
+			name text not null, topology text not null, status text not null,
+			coordinator_server_id text not null, task_id text not null,
+			credential_id text, metadata_json text,
+			created_at datetime not null, updated_at datetime not null
+		)`,
+		`create index if not exists orchestration_clusters_task on orchestration_clusters(task_id)`,
+		`create index if not exists orchestration_clusters_status on orchestration_clusters(status, updated_at)`,
+		`create table if not exists orchestration_cluster_nodes (
+			id text primary key, cluster_id text not null, server_id text not null,
+			role text not null, endpoint text, status text not null, node_order integer not null,
+			metadata_json text, created_at datetime not null, updated_at datetime not null,
+			unique(cluster_id, server_id)
+		)`,
+		`create index if not exists orchestration_cluster_nodes_cluster on orchestration_cluster_nodes(cluster_id, node_order)`,
 		`create table if not exists aifar_deployments (
 			id text primary key, instance_id text not null, service_name text not null,
 			desired_replicas integer not null, current_revision text not null, updating_revision text,
@@ -311,6 +358,18 @@ func (s *Store) migrate() error {
 	if err := s.ensureColumn("alerts", "acknowledged_at", `alter table alerts add column acknowledged_at datetime`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("orchestration_actions", "topology", `alter table orchestration_actions add column topology text not null default ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("orchestration_actions", "min_targets", `alter table orchestration_actions add column min_targets integer not null default 1`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("orchestration_actions", "max_targets", `alter table orchestration_actions add column max_targets integer not null default 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("orchestration_actions", "workflow_json", `alter table orchestration_actions add column workflow_json text not null default '{}'`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -319,7 +378,7 @@ func (s *Store) ensureColumn(table, column, stmt string) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	found := false
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -327,14 +386,23 @@ func (s *Store) ensureColumn(table, column, stmt string) error {
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
 			return err
 		}
 		if name == column {
-			return nil
+			found = true
+			break
 		}
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
 	}
 	_, err = s.db.Exec(stmt)
 	return err
@@ -441,7 +509,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "aifar_orchestration_locks", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "orchestration_packages", "orchestration_actions", "orchestration_action_steps", "orchestration_clusters", "orchestration_cluster_nodes", "aifar_orchestration_locks", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}

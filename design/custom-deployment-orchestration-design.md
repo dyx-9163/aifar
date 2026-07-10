@@ -6,6 +6,18 @@ Audience: AIFAR Deployment backend, frontend, installer, and runtime-agent maint
 
 本文定义一套“脚本执行面 + Go 控制面 + Vue 配置展示面”的自定义部署编排方案。目标是在保留当前 Apps、Tasks、Audit、Resources、Servers、Credentials 能力的前提下，让新应用尽量通过离线资源包和受信脚本接入，同时支持多服务器集群模式。
 
+文档关系：
+
+- 开发硬标准和质检 checklist 以 `design/development-standard.md` 为准。
+- 本文提供自定义部署编排的详细方案、接口草案和落地阶段。
+- 前端视觉与布局仍以 `design/ant-design-system-portable202606.md` 为准。
+
+质检口径：
+
+- 任何自定义部署能力不得绕过 task、target、step、audit、credential、resource 准入。
+- 任何脚本执行必须来自受信资源包或内置模板，不允许前端/API 直接提交自由 shell。
+- 多服务器集群必须明确 per-node、coordinator、bootstrap、post-check 和失败语义。
+
 ## 1. 结论
 
 推荐边界：
@@ -109,22 +121,49 @@ target servers
 
 ```text
 resources/<app>/<version>/
-  aifar-deploy.json
+  manifest.json
+  deployspec.yaml
+  deployspec.json
+  checksums.sha256
+  files/
+    app.tar.gz
+    image.tar
+    config-template/
+  rpms/
+    *.rpm
   scripts/
     install.sh
     check.sh
     uninstall.sh
     bootstrap.sh
-  files/
-    app.tar.gz
-    config-template/
-  rpms/
-    *.rpm
-  manifest.json
+    backup.sh
+    restore.sh
+    update.sh
+    rollback.sh
+  templates/
+  README.md
   *.sha256sum
 ```
 
-`manifest.json` 继续服务资源扫描和文件 hash。`aifar-deploy.json` 服务应用编排。
+`manifest.json` 继续服务资源扫描和文件 hash。`deployspec.yaml` 服务应用编排；`deployspec.json` 作为等价格式保留给不方便生成 YAML 的工具。两者同时存在时，以 `deployspec.yaml` 为准。
+
+目录职责：
+
+| 文件/目录 | 职责 | 是否安装必用 |
+| --- | --- | --- |
+| `manifest.json` | 资源扫描、文件清单、part、SHA256、版本元数据。 | 是。 |
+| `deployspec.yaml`/`deployspec.json` | 自定义部署 schema、拓扑、脚本、步骤、metadata 映射。 | 自定义/scripted 应用必需。 |
+| `checksums.sha256`/`*.sha256sum` | 包级完整性校验。 | 建议所有包提供。 |
+| `files/` | 应用二进制、压缩包、镜像归档、依赖资产。 | 按应用需要。 |
+| `rpms/` | 离线 RPM 依赖。 | 需要系统包时使用。 |
+| `scripts/install.sh` | 节点本地安装。 | 是。 |
+| `scripts/check.sh` | 节点本地检查。 | 长期运行服务必需。 |
+| `scripts/uninstall.sh` | 节点本地卸载。 | 可安装服务必需。 |
+| `scripts/bootstrap.sh` | coordinator 集群初始化。 | 集群拓扑必需。 |
+| `scripts/backup.sh`、`restore.sh` | 备份和还原。 | 有数据状态的服务应提供。 |
+| `scripts/update.sh`、`rollback.sh` | 升级和回滚。 | 支持版本更新时应提供。 |
+| `templates/` | 配置模板，由 Go 渲染后交给脚本。 | 有配置文件时使用。 |
+| `README.md` | 资源包说明、拓扑限制、人工验证方法。 | 运行时不读取，交付/质检必读。 |
 
 示例：
 
@@ -173,9 +212,60 @@ resources/<app>/<version>/
 
 - `scripts.*.path` 必须是资源包内相对路径，禁止绝对路径和 `..`。
 - 脚本必须由资源扫描发现并校验 hash。
+- Action 引用的 shell 脚本在隔离区发布前统一规范化为 UTF-8、无 BOM、LF 换行；CRLF 会转换为 LF，非法 UTF-8、NUL 字节和孤立 CR 必须拒绝。
+- `packageSha256` 记录用户上传的原始压缩包，`scriptSha256` 记录规范化后实际上传并执行的脚本，两者分别用于来源审计和执行完整性校验。
 - `secret: true` 的字段只能进入受保护的 context 文件，不能进入普通日志或审计 details。
 - 脚本应幂等。重复执行 install/check/delete 不应造成不可恢复状态。
 - 所有脚本以非交互方式运行，不能要求用户手工输入。
+
+### 6.1 当前可执行 ActionPackage 子集
+
+当前编排工作台已经落地 `aifar.io/v1alpha1` `ActionPackage`。它是上述完整 `ScriptedDeployment` 模型的先行子集，上传入口当前只接受 ZIP 根目录中的 `deployspec.json`，支持 `check` 和 `install` 两类 operation。不要把本节的当前格式与后续目标态 `deployspec.yaml` 混用。
+
+一个 Action 可以按顺序声明多个受信步骤：
+
+```json
+{
+  "apiVersion": "aifar.io/v1alpha1",
+  "kind": "ActionPackage",
+  "name": "mysql-offline-standalone",
+  "version": "1.0.0",
+  "actions": [
+    {
+      "name": "install-mysql",
+      "operation": "install",
+      "targetMode": "single",
+      "readOnly": false,
+      "timeoutSeconds": 1800,
+      "steps": [
+        {
+          "name": "check-system",
+          "title": { "zh": "检查系统参数", "en": "Check system prerequisites" },
+          "script": "scripts/02-check-system.sh",
+          "readOnly": true,
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "install-mysql",
+          "title": { "zh": "安装并验证 MySQL", "en": "Install and verify MySQL" },
+          "script": "scripts/04-install-mysql.sh",
+          "readOnly": false,
+          "timeoutSeconds": 1800
+        }
+      ]
+    }
+  ]
+}
+```
+
+当前准入和执行规则：
+
+- `check` Action 必须为 `readOnly: true`，且不能包含变更步骤；`install` Action 必须为 `readOnly: false`，且至少包含一个变更步骤。
+- `steps` 按声明顺序执行；每步独立记录 title、script SHA256、readOnly、timeout、task step 和目标日志。
+- Action 名和步骤名必须唯一，且不能占用 `load-server`、`verify-package`、`upload-package`、`record-result` 等平台步骤名。
+- 上传发布时校验相对路径和脚本存在性，并规范化脚本换行；执行前再次校验每个脚本的 SHA256。
+- dry-run 返回平台步骤和业务步骤的完整顺序；变更 Action 由管理端二次确认后创建 worker task，并写 target、step、日志和 audit。
+- 当前一个 Action 内只支持顺序步骤；跨 Action 模板、输出变量、并行组、coordinator 和 rollback 仍按后续里程碑建设。
 
 ## 7. 远端工作目录和上下文
 
@@ -538,6 +628,22 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
     return s.recordInstances(ctx, spec, bundle, cluster)
 }
 ```
+
+标准阶段映射：
+
+| scripted 阶段 | 标准步骤 | 说明 |
+| --- | --- | --- |
+| `selectTopology`、`validateTargets`、`validateParameters` | `validate-request` | Go 控制面完成参数、拓扑、目标数量和冲突校验。 |
+| `SelectBundle`、`VerifyBundle` | `verify-resource` | Go 控制面完成离线资源匹配和校验。 |
+| `loadServers`、`buildClusterContext` | `load-context` | 读取服务器、凭据、设置和集群上下文。 |
+| `PrepareWorkDir`、上下文渲染 | `prepare-target` | 每个目标创建工作目录、上下文文件和脚本。 |
+| `UploadBundle` | `upload-artifacts` | 上传资源包、脚本和上下文。 |
+| `RunNodeScript(install)` | `install-runtime` | 节点本地安装、配置和 readiness 等待。 |
+| `RunClusterScript(bootstrap)` | `cluster-bootstrap` | coordinator 执行 bootstrap/join/rebalance。 |
+| `RunNodeScript(check)` | `post-check` | 全量检查运行态并收集诊断。 |
+| `recordInstances` | `record-instance` | 写入实例、metadata、release 和凭据绑定。 |
+
+自定义部署 spec 应直接声明这些标准阶段；具体脚本可以命名为 `install.sh`、`bootstrap.sh`、`check.sh` 等，但任务中心展示和质检验收应按标准阶段核对。
 
 ### 8.5 Installer 实现
 
