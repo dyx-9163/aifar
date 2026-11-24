@@ -19,16 +19,56 @@ package fetch
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/kubesphere/kubekey/v4/pkg/connector"
 	"github.com/kubesphere/kubekey/v4/pkg/modules/internal"
 	testutil "github.com/kubesphere/kubekey/v4/pkg/modules/testutil"
 	"github.com/kubesphere/kubekey/v4/pkg/variable"
 )
+
+type linuxFetchConnector struct {
+	connector.Connector
+	remoteFile string
+	commands   []string
+}
+
+func (*linuxFetchConnector) Init(context.Context) error  { return nil }
+func (*linuxFetchConnector) Close(context.Context) error { return nil }
+func (c *linuxFetchConnector) ExecuteCommand(_ context.Context, command string) ([]byte, []byte, error) {
+	c.commands = append(c.commands, command)
+	return nil, nil, nil
+}
+func (c *linuxFetchConnector) FetchFile(_ context.Context, src string, dst io.Writer) error {
+	c.remoteFile = src
+	_, err := io.WriteString(dst, "remote file")
+	return err
+}
+
+func TestFetchUsesRemoteLinuxPath(t *testing.T) {
+	conn := &linuxFetchConnector{}
+	dest := filepath.Join(t.TempDir(), "local directory", "downloaded")
+	moduleContext := context.WithValue(t.Context(), internal.ConnKey, conn)
+	_, _, err := ModuleFetch(moduleContext, internal.ExecOptions{
+		Host: "node1", Variable: testutil.NewTestVariable([]string{"node1"}, nil),
+		Args: createRawArgs(map[string]any{"src": "/etc/example.conf", "dest": dest}),
+	})
+	require.NoError(t, err)
+	require.Regexp(t, `^/tmp/kubekey/fetch-[^/\\]+$`, conn.remoteFile)
+	require.Len(t, conn.commands, 2)
+	require.Contains(t, conn.commands[0], "install -m 0600")
+	require.Equal(t, "rm -f -- '"+conn.remoteFile+"'", conn.commands[1])
+	content, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	require.Equal(t, "remote file", string(content))
+}
 
 // createRawArgs creates a runtime.RawExtension from a map
 func createRawArgs(data map[string]any) runtime.RawExtension {

@@ -4,7 +4,9 @@
     - all
   tasks:
     - name: Pre | Copy global pre-installation script to remote hosts
-      when: (print "%s/pre_install.sh" .scripts_dir) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/pre_install.sh" .scripts_dir) | fileExists
       copy:
         src: >-
           {{ .scripts_dir }}/pre_install.sh
@@ -21,11 +23,14 @@
         mode: 0755
       loop: "{{ .pre_install_groups | default list | toJson }}"
       when:
+        - .os.type | default "" | ne "Windows"
         - (getStringSlice .groups .item) | default list | has .inventory_hostname
         - (print "%s/%s/pre_install.sh" .scripts_dir .item) | fileExists
 
     - name: Pre | Copy node-specific pre-installation script to remote hosts
-      when: (print "%s/pre_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/pre_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
       copy:
         src: >-
           {{ .scripts_dir }}/pre_install_{{ .inventory_hostname }}.sh
@@ -34,10 +39,15 @@
         mode: 0755
 
     - name: Pre | Execute global pre-installation script on remote hosts
-      when: (print "%s/pre_install.sh" .scripts_dir) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/pre_install.sh" .scripts_dir) | fileExists
       command: /etc/kubekey/scripts/pre_install.sh
 
     - name: Pre | Execute group pre-installation scripts in defined order
+      when:
+        - .os.type | default "" | ne "Windows"
+        - .pre_install_groups | default list | empty | not
       command: |
         for group in {{ .pre_install_groups | default list | join " " }}; do
           file="/etc/kubekey/scripts/pre_install_group_${group}.sh"
@@ -48,5 +58,7 @@
         done
 
     - name: Pre | Execute node-specific pre-installation script on remote hosts
-      when: (print "%s/pre_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/pre_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
       command: /etc/kubekey/scripts/pre_install_{{ .inventory_hostname }}.sh

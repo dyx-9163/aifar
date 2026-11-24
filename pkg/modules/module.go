@@ -20,6 +20,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	"github.com/kubesphere/kubekey/v4/pkg/modules/add_hostvars"
+	"github.com/kubesphere/kubekey/v4/pkg/modules/artifact_file"
 	"github.com/kubesphere/kubekey/v4/pkg/modules/assert"
 	"github.com/kubesphere/kubekey/v4/pkg/modules/command"
 	"github.com/kubesphere/kubekey/v4/pkg/modules/copy"
@@ -54,6 +55,7 @@ var FindModule = internal.FindModule
 func init() {
 	// Register all built-in modules
 	utilruntime.Must(internal.RegisterModule(add_hostvars.ModuleAddHostvars, "add_hostvars"))
+	utilruntime.Must(internal.RegisterModule(artifact_file.Run, "artifact_file"))
 	utilruntime.Must(internal.RegisterModule(assert.ModuleAssert, "assert"))
 	utilruntime.Must(internal.RegisterModule(command.ModuleCommand, "command", "shell"))
 	utilruntime.Must(internal.RegisterModule(copy.ModuleCopy, "copy"))

@@ -21,11 +21,13 @@ package builtin
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/cockroachdb/errors"
 	kkcorev1 "github.com/kubesphere/kubekey/api/core/v1"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubesphere/kubekey/v4/cmd/kk/app/options"
@@ -86,6 +88,23 @@ func (o *ArtifactExportOptions) Complete(cmd *cobra.Command, args []string) (*kk
 
 	if err := o.CommonOptions.Complete(playbook); err != nil {
 		return nil, err
+	}
+	if runtime.GOOS == "windows" {
+		config := o.Config.Value()
+		artifact, _, err := unstructured.NestedString(config, "download", "artifact_file")
+		if err != nil {
+			return nil, err
+		}
+		if artifact != "" {
+			return nil, errors.New("Windows artifact export does not support importing an existing artifact (-a or spec.download.artifact_file)")
+		}
+		charts, _, err := unstructured.NestedSlice(config, "download", "charts")
+		if err != nil {
+			return nil, err
+		}
+		if len(charts) != 0 {
+			return nil, errors.New("Windows artifact export does not support spec.download.charts")
+		}
 	}
 
 	return playbook, nil

@@ -1,5 +1,6 @@
 - name: Defaults | Reset temporary directory
   tags: ["always"]
+  when: .os.type | default "" | ne "Windows"
   command: |
     if [ -d {{ .tmp_dir }} ]; then
       rm -rf {{ .tmp_dir }}

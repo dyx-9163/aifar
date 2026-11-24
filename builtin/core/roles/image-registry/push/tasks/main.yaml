@@ -1,5 +1,6 @@
 ---
 - name: ImageRegistry | Ensure Harbor project exists for each image
+  when: .image_registry.type | default "" | eq "harbor"
   tags: ["push"]
   ignore_errors: true
   command: |
@@ -70,7 +71,7 @@
     src: "local://{{ .binary_dir }}/images/"
     dest: >-
       {{- if and (eq .module.image.reference.registry "registry.k8s.io") (.module.image.reference.repository | contains "/" | not) -}}
-      oci://{{ .image_registry.auth.registry }}/kubernetes/{{ .module.image.reference.repository }}:{{ .module.image.src.reference.reference }}
+      oci://{{ .image_registry.auth.registry }}/kubernetes/{{ .module.image.reference.repository }}:{{ .module.image.reference.reference }}
       {{- else -}}
       oci://{{ .image_registry.auth.registry }}/{{ .module.image.reference.repository }}:{{ .module.image.reference.reference }}
       {{- end -}}

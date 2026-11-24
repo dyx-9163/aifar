@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/rand"
 
@@ -93,28 +95,38 @@ func ModuleFetch(ctx context.Context, opts internal.ExecOptions) (string, string
 	defer conn.Close(ctx)
 
 	// fetch file
-	if _, err := os.Stat(filepath.Dir(destParam)); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(destParam), os.ModePerm); err != nil {
-			return internal.StdoutFailed, "failed to create dest dir", err
-		}
+	destDir := filepath.Dir(destParam)
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return internal.StdoutFailed, "failed to create dest dir", err
 	}
 
-	destFile, err := os.Create(destParam)
+	destFile, err := os.CreateTemp(destDir, ".kk-fetch-*")
 	if err != nil {
 		return internal.StdoutFailed, "failed to create dest file", err
 	}
+	defer os.Remove(destFile.Name())
 	defer destFile.Close()
 
-	tmpFetchFileName := filepath.Join(tmpDir, fmt.Sprintf("fetch-%s-%s", opts.Task.GetUID(), rand.String(5)))
-
-	_, _, err = conn.ExecuteCommand(ctx, fmt.Sprintf("cp %s %s\nchmod 755 %s", srcParam, tmpFetchFileName, tmpFetchFileName))
-
+	tmpFetchFileName := path.Join(tmpDir, fmt.Sprintf("fetch-%s-%s", opts.Task.GetUID(), rand.String(5)))
+	quote := func(value string) string {
+		return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+	}
+	remoteFile := quote(tmpFetchFileName)
+	// The sudo process stages the file for the SSH account used by SFTP.
+	_, _, err = conn.ExecuteCommand(ctx, "install -m 0600 -o \"${SUDO_UID:-$(id -u)}\" -- "+quote(srcParam)+" "+remoteFile)
 	if err != nil {
 		return internal.StdoutFailed, "failed to fetch file", err
 	}
+	defer conn.ExecuteCommand(ctx, "rm -f -- "+remoteFile)
 
 	if err = conn.FetchFile(ctx, tmpFetchFileName, destFile); err != nil {
 		return internal.StdoutFailed, "failed to fetch file", err
+	}
+	if err := destFile.Close(); err != nil {
+		return internal.StdoutFailed, "failed to close dest file", err
+	}
+	if err := os.Rename(destFile.Name(), destParam); err != nil {
+		return internal.StdoutFailed, "failed to replace dest file", err
 	}
 
 	return internal.StdoutSuccess, "", nil

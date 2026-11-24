@@ -86,7 +86,7 @@ type project struct {
 
 // ReadFile reads and returns the contents of the file at the given path
 func (f *project) ReadFile(path string) ([]byte, error) {
-	return fs.ReadFile(f.FS, path)
+	return fs.ReadFile(f.FS, filepath.ToSlash(path))
 }
 
 // Rel returns a relative path that is lexically equivalent to targpath when joined to basepath
@@ -96,7 +96,7 @@ func (f *project) Rel(root string, path string) (string, error) {
 
 // Stat returns the FileInfo for the file at the given path
 func (f *project) Stat(path string) (os.FileInfo, error) {
-	return fs.Stat(f.FS, path)
+	return fs.Stat(f.FS, filepath.ToSlash(path))
 }
 
 // WalkDir walks the file tree rooted at path, calling fn for each file or directory
@@ -121,6 +121,7 @@ func (f *project) MarshalPlaybook() (*kkprojectv1.Playbook, error) {
 
 // loadPlaybook loads a playbook and all its included playbooks into a single playbook
 func (f *project) loadPlaybook(fromPlayBook, basePlaybook string) error {
+	basePlaybook = filepath.ToSlash(basePlaybook)
 	// baseDir is the local ansible project dir which playbook belong to
 	if f.playbookGraph.AddEdgeAndCheckCycle(fromPlayBook, basePlaybook) {
 		// play book cycle imported
@@ -494,8 +495,9 @@ func (f *project) dealBlock(top string, source string, blocks []kkprojectv1.Bloc
 // getPath returns the first valid path from a list of possible paths
 func (f *project) getPath(paths []string) (string, fs.FileInfo) {
 	for _, path := range paths {
-		if info, err := fs.Stat(f.FS, path); err == nil {
-			return path, info
+		name := filepath.ToSlash(path)
+		if info, err := fs.Stat(f.FS, name); err == nil {
+			return name, info
 		}
 	}
 

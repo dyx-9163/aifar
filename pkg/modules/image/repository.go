@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 
 	_const "github.com/kubesphere/kubekey/v4/pkg/const"
+	"github.com/kubesphere/kubekey/v4/pkg/utils/artifactpath"
 )
 
 // repoCache caches *remote.Repository instances per local directory path.
@@ -203,8 +205,8 @@ func (i imageTransport) RoundTrip(request *http.Request) (*http.Response, error)
 // head handles HTTP HEAD requests for checking the existence of blobs and manifests
 // in the local directory storage.
 func (i imageTransport) head(request *http.Request) *http.Response {
-	if strings.HasSuffix(filepath.Dir(request.URL.Path), "blobs") { // blobs
-		filename := filepath.Join(i.baseDir, "blobs", filepath.Base(request.URL.Path))
+	if strings.HasSuffix(path.Dir(request.URL.Path), "/blobs") { // blobs
+		filename := filepath.Join(i.baseDir, "blobs", artifactpath.ImagePath(path.Base(request.URL.Path)))
 		fStat, err := os.Stat(filename)
 		if err != nil {
 			klog.V(4).ErrorS(err, "failed to stat blobs", "filename", filename)
@@ -216,10 +218,10 @@ func (i imageTransport) head(request *http.Request) *http.Response {
 			ContentLength: fStat.Size(),
 			Header:        http.Header{},
 		}
-	} else if strings.HasSuffix(filepath.Dir(request.URL.Path), "manifests") { // manifests
-		filename := filepath.Join(i.baseDir, request.Host, strings.TrimPrefix(request.URL.Path, apiPrefix))
+	} else if strings.HasSuffix(path.Dir(request.URL.Path), "/manifests") { // manifests
+		filename := filepath.Join(i.baseDir, artifactpath.ImagePath(request.Host), artifactpath.ImagePath(strings.TrimPrefix(request.URL.Path, apiPrefix)))
 
-		pathBase := filepath.Base(filename)
+		pathBase := path.Base(request.URL.Path)
 		digestParts := strings.Split(pathBase, "@")
 		var requestDigest string
 
@@ -255,7 +257,7 @@ func (i imageTransport) head(request *http.Request) *http.Response {
 			actualDigest = tagDigest[requestDigest]
 		}
 
-		actualFilename = filepath.Join(filepath.Dir(filename), actualDigest)
+		actualFilename = filepath.Join(filepath.Dir(filename), artifactpath.ImagePath(actualDigest))
 		// Read the manifest file
 		file, err := os.ReadFile(actualFilename)
 		if err != nil {
@@ -297,7 +299,7 @@ func (i imageTransport) post(request *http.Request) *http.Response {
 			Proto:      "Local",
 			StatusCode: http.StatusAccepted,
 			Header: http.Header{
-				"Location": []string{filepath.Dir(request.URL.Path)},
+				"Location": []string{path.Dir(request.URL.Path)},
 			},
 			Request: request,
 		}
@@ -312,7 +314,7 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 	if strings.HasSuffix(request.URL.Path, "/uploads") { // blobs
 		defer request.Body.Close()
 
-		filename := filepath.Join(i.baseDir, "blobs", request.URL.Query().Get("digest"))
+		filename := filepath.Join(i.baseDir, "blobs", artifactpath.ImagePath(request.URL.Query().Get("digest")))
 		dir := filepath.Dir(filename)
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			if err := os.MkdirAll(dir, _const.PermDirPublic); err != nil {
@@ -344,7 +346,7 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 		}
 
 		return responseCreated
-	} else if strings.HasSuffix(filepath.Dir(request.URL.Path), "/manifests") { // manifests
+	} else if strings.HasSuffix(path.Dir(request.URL.Path), "/manifests") { // manifests
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			klog.V(4).ErrorS(err, "failed to read request")
@@ -353,7 +355,7 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 		}
 		defer request.Body.Close()
 
-		filename := filepath.Join(i.baseDir, request.Host, strings.TrimPrefix(request.URL.Path, apiPrefix))
+		filename := filepath.Join(i.baseDir, artifactpath.ImagePath(request.Host), artifactpath.ImagePath(strings.TrimPrefix(request.URL.Path, apiPrefix)))
 		dir := filepath.Dir(filename)
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			if err := os.MkdirAll(dir, _const.PermDirPublic); err != nil {
@@ -363,7 +365,8 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 			}
 		}
 
-		if !strings.HasPrefix(filepath.Base(filename), "sha256:") {
+		reference := path.Base(request.URL.Path)
+		if !strings.HasPrefix(reference, "sha256:") {
 			// Compute digest if not provided in URL
 			hash := sha256.Sum256(body)
 			digest := "sha256:" + hex.EncodeToString(hash[:])
@@ -377,7 +380,7 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 				}
 			}
 			// Add the tag and digest to the layout file
-			tagDigest[filepath.Base(filename)] = digest
+			tagDigest[reference] = digest
 			// Write the updated list back to the layout file
 			data, err := json.MarshalIndent(tagDigest, "", "  ")
 			if err != nil {
@@ -389,7 +392,7 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 				return responseServerError
 			}
 			// Write the manifest file
-			if err := os.WriteFile(filepath.Join(dir, digest), body, _const.PermFilePublic); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, artifactpath.ImagePath(digest)), body, _const.PermFilePublic); err != nil {
 				klog.V(4).ErrorS(err, "failed to write file", "filename", filename)
 				return responseServerError
 			}
@@ -409,8 +412,8 @@ func (i imageTransport) put(request *http.Request) *http.Response {
 
 // get handles HTTP GET requests for retrieving blobs and manifests from local directory storage.
 func (i imageTransport) get(request *http.Request) *http.Response {
-	if strings.HasSuffix(filepath.Dir(request.URL.Path), "blobs") { // blobs
-		filename := filepath.Join(i.baseDir, "blobs", filepath.Base(request.URL.Path))
+	if strings.HasSuffix(path.Dir(request.URL.Path), "/blobs") { // blobs
+		filename := filepath.Join(i.baseDir, "blobs", artifactpath.ImagePath(path.Base(request.URL.Path)))
 		if _, err := os.Stat(filename); err != nil {
 			klog.V(4).ErrorS(err, "failed to stat blobs", "filename", filename)
 
@@ -437,10 +440,10 @@ func (i imageTransport) get(request *http.Request) *http.Response {
 			ContentLength: fStat.Size(),
 			Body:          file,
 		}
-	} else if strings.HasSuffix(filepath.Dir(request.URL.Path), "manifests") { // manifests
-		filename := filepath.Join(i.baseDir, request.Host, strings.TrimPrefix(request.URL.Path, apiPrefix))
+	} else if strings.HasSuffix(path.Dir(request.URL.Path), "/manifests") { // manifests
+		filename := filepath.Join(i.baseDir, artifactpath.ImagePath(request.Host), artifactpath.ImagePath(strings.TrimPrefix(request.URL.Path, apiPrefix)))
 
-		pathBase := filepath.Base(filename)
+		pathBase := path.Base(request.URL.Path)
 		digestParts := strings.Split(pathBase, "@")
 		var requestDigest string
 
@@ -476,7 +479,7 @@ func (i imageTransport) get(request *http.Request) *http.Response {
 			actualDigest = tagDigest[requestDigest]
 		}
 
-		actualFilename = filepath.Join(filepath.Dir(filename), actualDigest)
+		actualFilename = filepath.Join(filepath.Dir(filename), artifactpath.ImagePath(actualDigest))
 		if _, err := os.Stat(actualFilename); err != nil {
 			klog.V(4).ErrorS(err, "failed to stat manifest", "filename", actualFilename)
 			return responseNotFound

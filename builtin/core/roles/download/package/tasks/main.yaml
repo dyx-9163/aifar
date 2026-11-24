@@ -1,7 +1,14 @@
 ---
 - name: Package | Reset artifact directory
+  when: .os.type | default "" | ne "Windows"
   command: |
     rm -rf {{ .artifact_dir }} && mkdir -p {{ .artifact_dir }}
+
+- name: Package | Prepare artifact staging directory on Windows
+  when: .os.type | default "" | eq "Windows"
+  artifact_file:
+    action: prepare
+    directory: "{{ .artifact_dir }}"
 
 - name: Package | Verify helm is installed when charts are configured
   when: .download.charts | empty | not
@@ -25,6 +32,13 @@
     - include_tasks: tools.yaml
 
 - name: Package | Export artifact
+  when: .os.type | default "" | ne "Windows"
   command: |
     # package binary directory
     tar -czvf {{ .artifact_dir }}/kubekey-artifact.tgz -C {{ .artifact_dir }}/kubekey . && rm -rf {{ .artifact_dir }}/kubekey
+
+- name: Package | Export artifact on Windows
+  when: .os.type | default "" | eq "Windows"
+  artifact_file:
+    action: pack
+    directory: "{{ .artifact_dir }}"

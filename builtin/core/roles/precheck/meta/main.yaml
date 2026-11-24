@@ -3,7 +3,9 @@ dependencies:
     when: .inventory_hostname | eq "localhost"
 
   - role: precheck/image-registry/network
-    when: .inventory_hostname | eq "localhost"
+    when:
+      - .inventory_hostname | eq "localhost"
+      - .os.type | default "" | ne "Windows"
 
   - role: precheck/artifact
     tags: ["artifact"]

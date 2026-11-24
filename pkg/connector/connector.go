@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -141,6 +142,9 @@ func isLocalIP(ipAddr string) bool {
 }
 
 func PutData(ctx context.Context, data []byte, dest string, mode fs.FileMode, conn Connector) error {
+	if _, ok := conn.(*localConnector); ok && runtime.GOOS == "windows" {
+		return putLocalData(data, dest)
+	}
 	dest = filepath.ToSlash(dest)
 	// Use a relative temp name so that PutFile (which may prepend the
 	// connector's homedir to the destination) and the subsequent `mv` command

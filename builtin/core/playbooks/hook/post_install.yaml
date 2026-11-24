@@ -27,14 +27,18 @@
     - all
   roles:
     - role: security
-      when: .security_enhancement
+      when:
+        - .os.type | default "" | ne "Windows"
+        - .security_enhancement
 
 - name: Post | Run Post-Installation Scripts
   hosts:
     - all
   tasks:
     - name: Post | Copy global post-installation script to remote hosts
-      when: (print "%s/post_install.sh" .scripts_dir) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/post_install.sh" .scripts_dir) | fileExists
       copy:
         src: >-
           {{ .scripts_dir }}/post_install.sh
@@ -51,11 +55,14 @@
         mode: 0755
       loop: "{{ .post_install_groups | default list | toJson }}"
       when:
+        - .os.type | default "" | ne "Windows"
         - (getStringSlice .groups .item) | default list | has .inventory_hostname
         - (print "%s/%s/post_install.sh" .scripts_dir .item) | fileExists
 
     - name: Post | Copy node-specific post-installation script to remote hosts
-      when: (print "%s/post_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/post_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
       copy:
         src: >-
           {{ .scripts_dir }}/post_install_{{ .inventory_hostname }}.sh
@@ -64,10 +71,15 @@
         mode: 0755
 
     - name: Post | Execute global post-installation script on remote hosts
-      when: (print "%s/post_install.sh" .scripts_dir) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/post_install.sh" .scripts_dir) | fileExists
       command: /etc/kubekey/scripts/post_install.sh
 
     - name: Post | Execute group post-installation scripts in defined order
+      when:
+        - .os.type | default "" | ne "Windows"
+        - .post_install_groups | default list | empty | not
       command: |
         for group in {{ .post_install_groups | default list | join " " }}; do
           file="/etc/kubekey/scripts/post_install_group_${group}.sh"
@@ -78,5 +90,7 @@
         done
 
     - name: Post | Execute node-specific post-installation script on remote hosts
-      when: (print "%s/post_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
+      when:
+        - .os.type | default "" | ne "Windows"
+        - (print "%s/post_install_%s.sh" .scripts_dir .inventory_hostname) | fileExists
       command: /etc/kubekey/scripts/post_install_{{ .inventory_hostname }}.sh

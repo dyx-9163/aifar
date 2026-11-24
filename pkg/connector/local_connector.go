@@ -109,6 +109,28 @@ func (c *localConnector) PutFile(_ context.Context, src []byte, dst string, mode
 	return nil
 }
 
+// putLocalData replaces a Windows file without relying on sudo or mv.
+func putLocalData(data []byte, dest string) error {
+	parent := filepath.Dir(dest)
+	if err := os.MkdirAll(parent, _const.PermDirPublic); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(parent, ".kk-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(file.Name(), dest)
+}
+
 // FetchFile copies the src file to the dst writer. src is the local filename, dst is the local writer.
 func (c *localConnector) FetchFile(_ context.Context, src string, dst io.Writer) error {
 	file, err := os.Open(src)
@@ -156,6 +178,13 @@ func (c *localConnector) HostInfo(ctx context.Context) (map[string]any, error) {
 // getHostInfo from remote
 func (c *localConnector) getHostInfo(ctx context.Context) (map[string]any, error) {
 	switch runtime.GOOS {
+	case "windows":
+		return map[string]any{
+			_const.VariableOS: map[string]any{
+				_const.VariableOSType:         "Windows",
+				_const.VariableOSArchitecture: runtime.GOARCH,
+			},
+		}, nil
 	case "linux":
 		// os information
 		osVars := make(map[string]any)

@@ -24,6 +24,58 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+func TestImageRegistryPushDestination(t *testing.T) {
+	raw, err := os.ReadFile("../../../builtin/core/roles/image-registry/push/tasks/main.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tasks []struct {
+		Image struct {
+			Dest string `json:"dest"`
+		} `json:"image"`
+	}
+	if err := yaml.Unmarshal(raw, &tasks); err != nil {
+		t.Fatal(err)
+	}
+	var destination string
+	for _, task := range tasks {
+		if task.Image.Dest != "" {
+			destination = task.Image.Dest
+			break
+		}
+	}
+	if destination == "" {
+		t.Fatal("image push destination template missing")
+	}
+
+	tests := []struct {
+		registry   string
+		repository string
+		tag        string
+		want       string
+	}{
+		{"registry.k8s.io", "kube-apiserver", "v1.36.5", "oci://localhost:5000/kubernetes/kube-apiserver:v1.36.5"},
+		{"registry.k8s.io", "coredns/coredns", "v1.14.2", "oci://localhost:5000/coredns/coredns:v1.14.2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.repository, func(t *testing.T) {
+			vars := map[string]any{
+				"image_registry": map[string]any{"auth": map[string]any{"registry": "localhost:5000"}},
+				"module": map[string]any{"image": map[string]any{"reference": map[string]any{
+					"registry": tt.registry, "repository": tt.repository, "reference": tt.tag,
+				}}},
+			}
+			got, err := ParseFunc(vars, destination, StringFunc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("destination = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // kubeVipVariable returns a variable map shaped like the real defaults for
 // kubernetes.control_plane_endpoint.kube_vip, plus the extra host/group
 // context the kubevip.ARP/BGP templates read directly (kube_vip_interface,

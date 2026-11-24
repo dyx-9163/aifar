@@ -1,10 +1,22 @@
 ---
 - name: Artifact | Extract artifact archive to working directory
   tags: ["always"]
-  when: .download.artifact_file | fileExists
+  when:
+    - .os.type | default "" | ne "Windows"
+    - .download.artifact_file | fileExists
   command: |
     mkdir -p {{ .binary_dir }}
     tar -zxvf {{ .download.artifact_file }} -C {{ .binary_dir }}
+
+- name: Artifact | Extract artifact archive on Windows
+  tags: ["always"]
+  when:
+    - .os.type | default "" | eq "Windows"
+    - .download.artifact_file | fileExists
+  artifact_file:
+    action: unpack
+    directory: "{{ .binary_dir }}"
+    archive: "{{ .download.artifact_file }}"
 
 - name: Artifact | Load architecture-specific download URLs for each artifact version
   tags: ["always"]
@@ -41,5 +53,6 @@
 - name: Artifact | Set ownership of working directory to sudo user
   tags: ["always"]
   ignore_errors: true
+  when: .os.type | default "" | ne "Windows"
   command: |
     chown -R ${SUDO_UID}:${SUDO_GID} {{ .work_dir }}

@@ -185,6 +185,7 @@
 - name: Cert | Set ownership of the PKI directory to the sudo user
   block:
     - name: Cert | Change ownership of the PKI directory to the sudo user
+      when: .os.type | default "" | ne "Windows"
       ignore_errors: true
       command: |
         chown -R ${SUDO_UID}:${SUDO_GID} {{ .work_dir }}/pki
